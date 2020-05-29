@@ -357,7 +357,7 @@ func (s *RegionRequestSender) onRegionError(bo *Backoffer, ctx *RPCContext, seed
 				return false, errors.Trace(err)
 			}
 		} else {
-			// don't backoff if a new leader is reported.
+			// don't backoff if a new leader is returned.
 			s.regionCache.UpdateLeader(ctx.Region, notLeader.GetLeader().GetStoreId(), ctx.PeerIdx)
 		}
 
