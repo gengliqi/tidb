@@ -574,7 +574,7 @@ func (c *Column) GetDecimal(rowID int) *types.MyDecimal {
 
 // GetString returns the string in the specific row.
 func (c *Column) GetString(rowID int) string {
-	return string(hack.String(c.data[c.offsets[rowID]:c.offsets[rowID+1]]))
+	return string(c.data[c.offsets[rowID]:c.offsets[rowID+1]])
 }
 
 // GetJSON returns the JSON in the specific row.
