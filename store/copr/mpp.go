@@ -16,6 +16,7 @@ package copr
 
 import (
 	"context"
+	"io"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -41,6 +42,16 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+/*
+#cgo CXXFLAGS: -std=c++20
+#cgo LDFLAGS: -lc++ -L${SRCDIR}/../../lib -lraftstore_proxy -lcompute-engine-libd
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "ComputeEngineInterface.h"
+*/
+import "C"
 
 // MPPClient servers MPP requests.
 type MPPClient struct {
@@ -125,6 +136,31 @@ func (c *MPPClient) DispatchMPPTask(param kv.DispatchMPPTaskParam) (resp *mpp.Di
 		}
 	}
 
+	if config.GetGlobalConfig().EnableTiFlashComputeEngine {
+		reqBytes, err := mppReq.Marshal()
+		if err != nil {
+			return nil, false, err
+		}
+		size := C.uint32_t(len(reqBytes))
+		reqBytesPtr := C.CBytes(reqBytes)
+		rawReq := C.newRawString(reqBytesPtr, size)
+
+		var rawResp C.RawString
+		errCode := C.dispatchMPPTask(nil, rawReq, &rawResp)
+		if errCode != 0 {
+			return nil, false, errors.New("dispatchMPPTask failed")
+		}
+
+		respBytes := C.GoBytes(rawResp.data, C.int(rawResp.size))
+		resp = &mpp.DispatchTaskResponse{}
+		resp.Unmarshal(respBytes)
+
+		C.deleteRawString(rawReq)
+		C.deleteRawString(rawResp)
+
+		return resp, false, nil
+	}
+
 	wrappedReq := tikvrpc.NewRequest(tikvrpc.CmdMPPTask, mppReq, kvrpcpb.Context{})
 	wrappedReq.StoreTp = getEndPointType(kv.TiFlash)
 
@@ -200,6 +236,24 @@ func (c *MPPClient) CancelMPPTasks(param kv.CancelMPPTasksParam) {
 		Meta: &mpp.TaskMeta{StartTs: firstReq.StartTs, GatherId: firstReq.GatherID, QueryTs: firstReq.MppQueryID.QueryTs, LocalQueryId: firstReq.MppQueryID.LocalQueryID, ServerId: firstReq.MppQueryID.ServerID, MppVersion: firstReq.MppVersion.ToInt64()},
 	}
 
+	if config.GetGlobalConfig().EnableTiFlashComputeEngine {
+		reqBytes, err := killReq.Marshal()
+		if err != nil {
+			return
+		}
+		size := C.uint32_t(len(reqBytes))
+		reqBytesPtr := C.CBytes(reqBytes)
+		rawReq := C.newRawString(reqBytesPtr, size)
+
+		var rawResp C.RawString
+		C.cancelMPPTask(nil, rawReq, &rawResp)
+
+		C.deleteRawString(rawReq)
+		C.deleteRawString(rawResp)
+
+		return
+	}
+
 	wrappedReq := tikvrpc.NewRequest(tikvrpc.CmdMPPCancel, killReq, kvrpcpb.Context{})
 	wrappedReq.StoreTp = getEndPointType(kv.TiFlash)
 
@@ -226,8 +280,53 @@ func (c *MPPClient) CancelMPPTasks(param kv.CancelMPPTasksParam) {
 	}
 }
 
+type GRPCMPPStreamResponse struct {
+	stream   *tikvrpc.MPPStreamResponse
+	is_first bool
+}
+
+func (s *GRPCMPPStreamResponse) NextResponse() (*mpp.MPPDataPacket, error) {
+	if s.is_first {
+		s.is_first = false
+		return s.stream.MPPDataPacket, nil
+	}
+	return s.stream.Recv()
+}
+
+func (s *GRPCMPPStreamResponse) Close() {
+	s.stream.Close()
+}
+
+type CGOMPPStreamResponse struct {
+	stream *C.MPPStreamResponse
+}
+
+func (s *CGOMPPStreamResponse) NextResponse() (*mpp.MPPDataPacket, error) {
+	var rawResp C.RawString
+	errCode := C.nextResponse(s.stream, &rawResp)
+	if errCode == 0 {
+		// succeed
+		respBytes := C.GoBytes(rawResp.data, C.int(rawResp.size))
+		resp := &mpp.MPPDataPacket{}
+		resp.Unmarshal(respBytes)
+		C.deleteRawString(rawResp)
+		return resp, nil
+	} else if errCode == 1 {
+		// end
+		return nil, io.EOF
+	} else {
+		// meet error
+		return nil, errors.New("MPPStreamResponse NextResponse failed")
+	}
+}
+
+func (s *CGOMPPStreamResponse) Close() {
+	C.deleteMPPStreamResponse(s.stream)
+	s.stream = nil
+}
+
 // EstablishMPPConns build a mpp connection to receive data, return valid response when err is nil
-func (c *MPPClient) EstablishMPPConns(param kv.EstablishMPPConnsParam) (*tikvrpc.MPPStreamResponse, error) {
+func (c *MPPClient) EstablishMPPConns(param kv.EstablishMPPConnsParam) (kv.MPPStreamResponse, error) {
 	req := param.Req
 	taskMeta := param.TaskMeta
 	connReq := &mpp.EstablishMPPConnectionRequest{
@@ -245,6 +344,24 @@ func (c *MPPClient) EstablishMPPConns(param kv.EstablishMPPConnsParam) (*tikvrpc
 
 	var err error
 
+	if config.GetGlobalConfig().EnableTiFlashComputeEngine {
+		reqBytes, err := connReq.Marshal()
+		if err != nil {
+			return nil, err
+		}
+		size := C.uint32_t(len(reqBytes))
+		reqBytesPtr := C.CBytes(reqBytes)
+		rawReq := C.newRawString(reqBytesPtr, size)
+
+		var streamResponse *C.MPPStreamResponse
+		errCode := C.establishMPPConnection(nil, rawReq, &streamResponse)
+		if errCode != 0 {
+			return nil, errors.New("establishMPPConnection failed")
+		}
+
+		return &CGOMPPStreamResponse{stream: streamResponse}, nil
+	}
+
 	wrappedReq := tikvrpc.NewRequest(tikvrpc.CmdMPPConn, connReq, kvrpcpb.Context{})
 	wrappedReq.StoreTp = getEndPointType(kv.TiFlash)
 
@@ -261,7 +378,7 @@ func (c *MPPClient) EstablishMPPConns(param kv.EstablishMPPConnsParam) (*tikvrpc
 	}
 
 	streamResponse := rpcResp.Resp.(*tikvrpc.MPPStreamResponse)
-	return streamResponse, nil
+	return &GRPCMPPStreamResponse{stream: streamResponse, is_first: true}, nil
 }
 
 // CheckVisibility checks if it is safe to read using given ts.

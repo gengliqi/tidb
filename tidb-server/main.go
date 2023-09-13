@@ -88,6 +88,13 @@ import (
 	"go.uber.org/zap"
 )
 
+/*
+#include <stdio.h>
+#include <stdlib.h>
+#include "../store/copr/ComputeEngineInterface.h"
+*/
+import "C"
+
 // Flag Names
 const (
 	nmVersion          = "V"
@@ -218,6 +225,16 @@ func main() {
 			config.GetGlobalConfig().AutoScalerClusterID,
 			config.GetGlobalConfig().IsTiFlashComputeFixedPool)
 		terror.MustNil(err)
+	}
+
+	if config.GetGlobalConfig().EnableTiFlashComputeEngine {
+		logutil.BgLogger().Info("enable tiflash compute engine", zap.String("compute-engine-config", config.GetGlobalConfig().TiFlashComputeEngineConfig))
+		go func() {
+			tiflashConfig := C.CString(config.GetGlobalConfig().TiFlashComputeEngineConfig)
+			C.runComputeEngine(tiflashConfig)
+		}()
+	} else {
+		logutil.BgLogger().Info("not enable tiflash compute engine")
 	}
 
 	// Enable failpoints in tikv/client-go if the test API is enabled.

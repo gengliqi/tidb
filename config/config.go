@@ -312,6 +312,9 @@ type Config struct {
 	InMemSlowQueryTopNNum int `toml:"in-mem-slow-query-topn-num" json:"in-mem-slow-query-topn-num"`
 	// InMemSlowQueryRecentNum indicates the number of recent slow queries stored in memory.
 	InMemSlowQueryRecentNum int `toml:"in-mem-slow-query-recent-num" json:"in-mem-slow-query-recent-num"`
+
+	EnableTiFlashComputeEngine bool   `toml:"enable-tiflash-compute-engine" json:"enable-tiflash-compute-engine"`
+	TiFlashComputeEngineConfig string `toml:"tiflash-compute-engine-config" json:"tiflash-compute-engine-config"`
 }
 
 // UpdateTempStoragePath is to update the `TempStoragePath` if port/statusPort was changed
@@ -1069,6 +1072,7 @@ var defaultConf = Config{
 	TiDBEnableExitCheck:                  false,
 	InMemSlowQueryTopNNum:                30,
 	InMemSlowQueryRecentNum:              500,
+	EnableTiFlashComputeEngine:           false,
 }
 
 var (

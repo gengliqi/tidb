@@ -25,7 +25,6 @@ import (
 	"github.com/pingcap/tidb/util/tiflashcompute"
 	"github.com/pingcap/tipb/go-tipb"
 	"github.com/tikv/client-go/v2/tikv"
-	"github.com/tikv/client-go/v2/tikvrpc"
 )
 
 // MppVersion indicates the mpp-version used to build mpp plan
@@ -177,6 +176,11 @@ type DispatchMPPTaskParam struct {
 	Bo                         *tikv.Backoffer
 }
 
+type MPPStreamResponse interface {
+	NextResponse() (*mpp.MPPDataPacket, error)
+	Close()
+}
+
 // MPPClient accepts and processes mpp requests.
 type MPPClient interface {
 	// ConstructMPPTasks schedules task for a plan fragment.
@@ -187,7 +191,7 @@ type MPPClient interface {
 	DispatchMPPTask(DispatchMPPTaskParam) (resp *mpp.DispatchTaskResponse, retry bool, err error)
 
 	// EstablishMPPConns build a mpp connection to receive data, return valid response when err is nil.
-	EstablishMPPConns(EstablishMPPConnsParam) (*tikvrpc.MPPStreamResponse, error)
+	EstablishMPPConns(EstablishMPPConnsParam) (MPPStreamResponse, error)
 
 	// CancelMPPTasks cancels mpp tasks.
 	CancelMPPTasks(CancelMPPTasksParam)

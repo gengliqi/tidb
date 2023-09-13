@@ -493,19 +493,9 @@ func (c *localMppCoordinator) receiveResults(req *kv.MPPDispatchRequest, taskMet
 	}
 
 	defer stream.Close()
-	resp := stream.MPPDataPacket
-	if resp == nil {
-		return
-	}
 
 	for {
-		err := c.handleMPPStreamResponse(bo, resp, req)
-		if err != nil {
-			c.sendError(err)
-			return
-		}
-
-		resp, err = stream.Recv()
+		resp, err := stream.NextResponse()
 		if err != nil {
 			if errors.Cause(err) == io.EOF {
 				return
@@ -524,6 +514,11 @@ func (c *localMppCoordinator) receiveResults(req *kv.MPPDispatchRequest, taskMet
 			} else {
 				c.sendError(err)
 			}
+			return
+		}
+		err = c.handleMPPStreamResponse(bo, resp, req)
+		if err != nil {
+			c.sendError(err)
 			return
 		}
 	}
