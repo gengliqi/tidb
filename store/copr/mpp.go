@@ -45,7 +45,7 @@ import (
 
 /*
 #cgo CXXFLAGS: -std=c++20
-#cgo LDFLAGS: -lc++ -L${SRCDIR}/../../lib -ltiflash_proxy -lcompute-engine-lib
+#cgo LDFLAGS: -L${SRCDIR}/../../lib -lc++ -lc++abi -ltiflash_proxy -lcompute-engine-lib
 
 #include <stdio.h>
 #include <stdlib.h>
