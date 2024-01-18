@@ -92,7 +92,7 @@ import (
 /*
 #include <stdio.h>
 #include <stdlib.h>
-#include "../store/copr/ComputeEngineInterface.h"
+#include "../../pkg/store/copr/ComputeEngineInterface.h"
 */
 import "C"
 

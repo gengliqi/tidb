@@ -6,7 +6,9 @@ extern "C" {
 
 #include <stdint.h>
 
-void runComputeEngine(char * config);
+#define EXPORT __attribute ((visibility ("default")))
+
+EXPORT void runComputeEngine(char * config);
 
 typedef struct RawString
 {
@@ -14,21 +16,21 @@ typedef struct RawString
     uint32_t size;
 } RawString;
 
-RawString newRawString(void * data, uint32_t size);
-void deleteRawString(RawString s);
+EXPORT RawString newRawString(void * data, uint32_t size);
+EXPORT void deleteRawString(RawString s);
 
 // TODO: use local context instead of global context
 extern void * global_flash_context;
 
-int dispatchMPPTask(void * ctx, RawString raw_request, RawString * raw_response);
+EXPORT int dispatchMPPTask(void * ctx, RawString raw_request, RawString * raw_response);
 
 typedef struct MPPStreamResponse MPPStreamResponse;
 
-int establishMPPConnection(void * ctx, RawString raw_request, MPPStreamResponse ** stream_response);
-int nextResponse(MPPStreamResponse * stream_response, RawString * raw_response);
-void deleteMPPStreamResponse(MPPStreamResponse * stream_response);
+EXPORT int establishMPPConnection(void * ctx, RawString raw_request, MPPStreamResponse ** stream_response);
+EXPORT int nextResponse(MPPStreamResponse * stream_response, RawString * raw_response);
+EXPORT void deleteMPPStreamResponse(MPPStreamResponse * stream_response);
 
-int cancelMPPTask(void * ctx, RawString raw_request, RawString * raw_response);
+EXPORT int cancelMPPTask(void * ctx, RawString raw_request, RawString * raw_response);
 
 #ifdef __cplusplus
 }
