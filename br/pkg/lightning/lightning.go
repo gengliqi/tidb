@@ -41,6 +41,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/kvproto/pkg/import_sstpb"
+	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/br/pkg/lightning/backend/local"
 	"github.com/pingcap/tidb/br/pkg/lightning/checkpoints"
 	"github.com/pingcap/tidb/br/pkg/lightning/common"
@@ -56,14 +57,15 @@ import (
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/br/pkg/version/build"
-	_ "github.com/pingcap/tidb/expression" // get rid of `import cycle`: just init expression.RewriteAstExpr,and called at package `backend.kv`.
-	_ "github.com/pingcap/tidb/planner/core"
-	"github.com/pingcap/tidb/util"
-	"github.com/pingcap/tidb/util/promutil"
+	_ "github.com/pingcap/tidb/pkg/expression" // get rid of `import cycle`: just init expression.RewriteAstExpr,and called at package `backend.kv`.
+	_ "github.com/pingcap/tidb/pkg/planner/core"
+	"github.com/pingcap/tidb/pkg/util"
+	"github.com/pingcap/tidb/pkg/util/promutil"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/shurcooL/httpgzip"
+	pdhttp "github.com/tikv/pd/client/http"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -441,7 +443,7 @@ func (l *Lightning) run(taskCtx context.Context, taskCfg *config.Config, o *opti
 	}()
 	l.metrics = metrics
 
-	ctx := metric.NewContext(taskCtx, metrics)
+	ctx := metric.WithMetric(taskCtx, metrics)
 	ctx = log.NewContext(ctx, o.logger)
 	ctx, cancel := context.WithCancel(ctx)
 	l.cancelLock.Lock()
@@ -1054,7 +1056,7 @@ func CleanupMetas(ctx context.Context, cfg *config.Config, tableName string) err
 }
 
 // SwitchMode switches the mode of the TiKV cluster.
-func SwitchMode(ctx context.Context, cfg *config.Config, tls *common.TLS, mode string, ranges ...*import_sstpb.Range) error {
+func SwitchMode(ctx context.Context, cli pdhttp.Client, tls *common.TLS, mode string, ranges ...*import_sstpb.Range) error {
 	var m import_sstpb.SwitchMode
 	switch mode {
 	case config.ImportMode:
@@ -1067,9 +1069,9 @@ func SwitchMode(ctx context.Context, cfg *config.Config, tls *common.TLS, mode s
 
 	return tikv.ForAllStores(
 		ctx,
-		tls.WithHost(cfg.TiDB.PdAddr),
-		tikv.StoreStateDisconnected,
-		func(c context.Context, store *tikv.Store) error {
+		cli,
+		metapb.StoreState_Offline,
+		func(c context.Context, store *pdhttp.MetaStore) error {
 			return tikv.SwitchMode(c, tls, store.Address, m, ranges...)
 		},
 	)

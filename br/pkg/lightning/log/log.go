@@ -20,9 +20,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/pingcap/errors"
 	pclog "github.com/pingcap/log"
-	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/pkg/util/logutil"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc/codes"
@@ -97,7 +98,7 @@ func InitLogger(cfg *Config, _ string) error {
 	// Disable annoying TiDB Log.
 	// TODO: some error logs outputs randomly, we need to fix them in TiDB.
 	// this LEVEL only affects SlowQueryLogger, later ReplaceGlobals will overwrite it.
-	tidbLogCfg.Level = "debug"
+	tidbLogCfg.Level = "fatal"
 	// this also init GRPCLogger, controlled by GRPC_DEBUG env.
 	err := logutil.InitLogger(&tidbLogCfg)
 	if err != nil {
@@ -177,8 +178,26 @@ func With(fields ...zap.Field) Logger {
 // IsContextCanceledError returns whether the error is caused by context
 // cancellation.
 func IsContextCanceledError(err error) bool {
+	if err == nil {
+		return false
+	}
 	err = errors.Cause(err)
-	return err == context.Canceled || status.Code(err) == codes.Canceled
+	if err == context.Canceled || status.Code(err) == codes.Canceled {
+		return true
+	}
+
+	// see https://github.com/aws/aws-sdk-go/blob/9d1f49ba/aws/credentials/credentials.go#L246-L249
+	// 2 cases that have meet:
+	// 	awserr.New("RequestCanceled", "request context canceled", err) and the nested err is context.Canceled
+	// 	awserr.New( "MultipartUpload", "upload multipart failed", err) and the nested err is the upper one
+	if v, ok := err.(awserr.BatchedErrors); ok {
+		for _, origErr := range v.OrigErrs() {
+			if IsContextCanceledError(origErr) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Begin marks the beginning of a task.

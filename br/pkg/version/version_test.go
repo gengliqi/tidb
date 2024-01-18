@@ -13,7 +13,7 @@ import (
 	"github.com/coreos/go-semver/semver"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/br/pkg/version/build"
-	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/stretchr/testify/require"
 	pd "github.com/tikv/pd/client"
 )
@@ -44,6 +44,13 @@ func TestCheckClusterVersion(t *testing.T) {
 
 	mock := mockPDClient{
 		Client: nil,
+	}
+	{
+		mock.getAllStores = func() []*metapb.Store {
+			return []*metapb.Store{{Version: `v5.4.2`}}
+		}
+		err := CheckClusterVersion(context.Background(), &mock, CheckVersionForBRPiTR)
+		require.NoError(t, err)
 	}
 
 	{

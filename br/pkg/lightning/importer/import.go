@@ -30,6 +30,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/br/pkg/backup"
 	berrors "github.com/pingcap/tidb/br/pkg/errors"
 	"github.com/pingcap/tidb/br/pkg/lightning/backend"
@@ -51,22 +52,25 @@ import (
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/br/pkg/version"
 	"github.com/pingcap/tidb/br/pkg/version/build"
-	tidbconfig "github.com/pingcap/tidb/config"
-	tidbkv "github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/parser"
-	"github.com/pingcap/tidb/parser/model"
-	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/store/driver"
-	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/collate"
-	"github.com/pingcap/tidb/util/mathutil"
-	regexprrouter "github.com/pingcap/tidb/util/regexpr-router"
-	"github.com/pingcap/tidb/util/set"
+	tidbconfig "github.com/pingcap/tidb/pkg/config"
+	"github.com/pingcap/tidb/pkg/keyspace"
+	tidbkv "github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta/autoid"
+	"github.com/pingcap/tidb/pkg/parser"
+	"github.com/pingcap/tidb/pkg/parser/model"
+	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/store/driver"
+	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/collate"
+	"github.com/pingcap/tidb/pkg/util/etcd"
+	regexprrouter "github.com/pingcap/tidb/pkg/util/regexpr-router"
+	"github.com/pingcap/tidb/pkg/util/set"
 	"github.com/prometheus/client_golang/prometheus"
 	tikvconfig "github.com/tikv/client-go/v2/config"
 	kvutil "github.com/tikv/client-go/v2/util"
 	pd "github.com/tikv/pd/client"
+	pdhttp "github.com/tikv/pd/client/http"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/atomic"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
@@ -88,7 +92,7 @@ const (
 	TaskMetaTableName  = "task_meta_v2"
 	TableMetaTableName = "table_meta"
 	// CreateTableMetadataTable stores the per-table sub jobs information used by TiDB Lightning
-	CreateTableMetadataTable = `CREATE TABLE IF NOT EXISTS %s (
+	CreateTableMetadataTable = `CREATE TABLE IF NOT EXISTS %s.%s (
 		task_id 			BIGINT(20) UNSIGNED,
 		table_id 			BIGINT(64) NOT NULL,
 		table_name 			VARCHAR(64) NOT NULL,
@@ -105,7 +109,7 @@ const (
 		PRIMARY KEY (table_id, task_id)
 	);`
 	// CreateTaskMetaTable stores the pre-lightning metadata used by TiDB Lightning
-	CreateTaskMetaTable = `CREATE TABLE IF NOT EXISTS %s (
+	CreateTaskMetaTable = `CREATE TABLE IF NOT EXISTS %s.%s (
 		task_id BIGINT(20) UNSIGNED NOT NULL,
 		pd_cfgs VARCHAR(2048) NOT NULL DEFAULT '',
 		status  VARCHAR(32) NOT NULL,
@@ -203,11 +207,11 @@ type Controller struct {
 	backend       backend.Backend
 	db            *sql.DB
 	pdCli         pd.Client
+	pdHTTPCli     pdhttp.Client
 
-	alterTableLock sync.Mutex
-	sysVars        map[string]string
-	tls            *common.TLS
-	checkTemplate  Template
+	sysVars       map[string]string
+	tls           *common.TLS
+	checkTemplate Template
 
 	errorSummaries errorSummaries
 
@@ -340,6 +344,7 @@ func NewImportControllerWithPauser(
 	var encodingBuilder encode.EncodingBuilder
 	var backendObj backend.Backend
 	var pdCli pd.Client
+	var pdHTTPCli pdhttp.Client
 	switch cfg.TikvImporter.Backend {
 	case config.BackendTiDB:
 		encodingBuilder = tidb.NewEncodingBuilder()
@@ -355,13 +360,16 @@ func NewImportControllerWithPauser(
 		if maxOpenFiles < 0 {
 			maxOpenFiles = math.MaxInt32
 		}
-		pdCli, err = pd.NewClientWithContext(ctx, []string{cfg.TiDB.PdAddr}, tls.ToPDSecurityOption())
+
+		addrs := strings.Split(cfg.TiDB.PdAddr, ",")
+		pdCli, err = pd.NewClientWithContext(ctx, addrs, tls.ToPDSecurityOption())
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
+		pdHTTPCli = pdhttp.NewClient("lightning", addrs, pdhttp.WithTLSConfig(tls.TLSConfig()))
 
 		if cfg.TikvImporter.DuplicateResolution != config.DupeResAlgNone {
-			if err := tikv.CheckTiKVVersion(ctx, tls, pdCli.GetLeaderAddr(), minTiKVVersionForDuplicateResolution, maxTiKVVersionForDuplicateResolution); err != nil {
+			if err := tikv.CheckTiKVVersion(ctx, pdHTTPCli, minTiKVVersionForDuplicateResolution, maxTiKVVersionForDuplicateResolution); err != nil {
 				if !berrors.Is(err, berrors.ErrVersionMismatch) {
 					return nil, common.ErrCheckKVVersion.Wrap(err).GenWithStackByArgs()
 				}
@@ -439,17 +447,16 @@ func NewImportControllerWithPauser(
 
 	var wrapper backend.TargetInfoGetter
 	if cfg.TikvImporter.Backend == config.BackendLocal {
-		wrapper = local.NewTargetInfoGetter(tls, db, pdCli)
+		wrapper = local.NewTargetInfoGetter(tls, db, pdHTTPCli)
 	} else {
 		wrapper = tidb.NewTargetInfoGetter(db)
 	}
 	ioWorkers := worker.NewPool(ctx, cfg.App.IOConcurrency, "io")
 	targetInfoGetter := &TargetInfoGetterImpl{
-		cfg:     cfg,
-		db:      db,
-		tls:     tls,
-		backend: wrapper,
-		pdCli:   pdCli,
+		cfg:       cfg,
+		db:        db,
+		backend:   wrapper,
+		pdHTTPCli: pdHTTPCli,
 	}
 	preInfoGetter, err := NewPreImportInfoGetter(
 		cfg,
@@ -464,7 +471,7 @@ func NewImportControllerWithPauser(
 	}
 
 	preCheckBuilder := NewPrecheckItemBuilder(
-		cfg, p.DBMetas, preInfoGetter, cpdb, pdCli,
+		cfg, p.DBMetas, preInfoGetter, cpdb, pdHTTPCli,
 	)
 
 	rc := &Controller{
@@ -480,6 +487,7 @@ func NewImportControllerWithPauser(
 		engineMgr:     backend.MakeEngineManager(backendObj),
 		backend:       backendObj,
 		pdCli:         pdCli,
+		pdHTTPCli:     pdHTTPCli,
 		db:            db,
 		sysVars:       common.DefaultImportantVariables,
 		tls:           tls,
@@ -504,7 +512,7 @@ func NewImportControllerWithPauser(
 		preInfoGetter:       preInfoGetter,
 		precheckItemBuilder: preCheckBuilder,
 		encBuilder:          encodingBuilder,
-		tikvModeSwitcher:    local.NewTiKVModeSwitcher(tls, pdCli, log.FromContext(ctx).Logger),
+		tikvModeSwitcher:    local.NewTiKVModeSwitcher(tls, pdHTTPCli, log.FromContext(ctx).Logger),
 
 		keyspaceName:      p.KeyspaceName,
 		resourceGroupName: p.ResourceGroupName,
@@ -844,7 +852,7 @@ func (rc *Controller) restoreSchema(ctx context.Context) error {
 	// we can handle the duplicated created with createIfNotExist statement
 	// and we will check the schema in TiDB is valid with the datafile in DataCheck later.
 	logTask := log.FromContext(ctx).Begin(zap.InfoLevel, "restore all schema")
-	concurrency := mathutil.Min(rc.cfg.App.RegionConcurrency, 8)
+	concurrency := min(rc.cfg.App.RegionConcurrency, 8)
 	childCtx, cancel := context.WithCancel(ctx)
 	p := parser.New()
 	p.SetSQLMode(rc.cfg.TiDB.SQLMode)
@@ -978,7 +986,7 @@ func verifyLocalFile(ctx context.Context, cpdb checkpoints.DB, dir string) error
 	}
 	for tableName, engineIDs := range targetTables {
 		for _, engineID := range engineIDs {
-			_, eID := backend.MakeUUID(tableName, engineID)
+			_, eID := backend.MakeUUID(tableName, int64(engineID))
 			file := local.Engine{UUID: eID}
 			err := file.Exist(dir)
 			if err != nil {
@@ -1435,7 +1443,8 @@ const (
 
 func (rc *Controller) keepPauseGCForDupeRes(ctx context.Context) (<-chan struct{}, error) {
 	tlsOpt := rc.tls.ToPDSecurityOption()
-	pdCli, err := pd.NewClientWithContext(ctx, []string{rc.pdCli.GetLeaderAddr()}, tlsOpt)
+	addrs := strings.Split(rc.cfg.TiDB.PdAddr, ",")
+	pdCli, err := pd.NewClientWithContext(ctx, addrs, tlsOpt)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -1555,6 +1564,7 @@ func (rc *Controller) importTables(ctx context.Context) (finalErr error) {
 	cleanup := false
 	postProgress := func() error { return nil }
 	var kvStore tidbkv.Storage
+	var etcdCli *clientv3.Client
 
 	if isLocalBackend(rc.cfg) {
 		var (
@@ -1608,6 +1618,16 @@ func (rc *Controller) importTables(ctx context.Context) (finalErr error) {
 		if err != nil {
 			return errors.Trace(err)
 		}
+		etcdCli, err := clientv3.New(clientv3.Config{
+			Endpoints:        []string{rc.cfg.TiDB.PdAddr},
+			AutoSyncInterval: 30 * time.Second,
+			TLS:              rc.tls.TLSConfig(),
+		})
+		if err != nil {
+			return errors.Trace(err)
+		}
+		etcd.SetEtcdCliByNamespace(etcdCli, keyspace.MakeKeyspaceEtcdNamespace(kvStore.GetCodec()))
+
 		manager, err := NewChecksumManager(ctx, rc, kvStore)
 		if err != nil {
 			return errors.Trace(err)
@@ -1668,6 +1688,11 @@ func (rc *Controller) importTables(ctx context.Context) (finalErr error) {
 				logTask.Warn("failed to close kv store", zap.Error(err))
 			}
 		}
+		if etcdCli != nil {
+			if err := etcdCli.Close(); err != nil {
+				logTask.Warn("failed to close etcd client", zap.Error(err))
+			}
+		}
 	}()
 
 	taskCh := make(chan task, rc.cfg.App.IndexConcurrency)
@@ -1717,7 +1742,7 @@ func (rc *Controller) importTables(ctx context.Context) (finalErr error) {
 			if err != nil {
 				return errors.Trace(err)
 			}
-			tr, err := NewTableImporter(tableName, tableMeta, dbInfo, tableInfo, cp, igCols.ColumnsMap(), kvStore, log.FromContext(ctx))
+			tr, err := NewTableImporter(tableName, tableMeta, dbInfo, tableInfo, cp, igCols.ColumnsMap(), kvStore, etcdCli, log.FromContext(ctx))
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -1903,13 +1928,12 @@ func (rc *Controller) fullCompact(ctx context.Context) error {
 }
 
 func (rc *Controller) doCompact(ctx context.Context, level int32) error {
-	tls := rc.tls.WithHost(rc.pdCli.GetLeaderAddr())
 	return tikv.ForAllStores(
 		ctx,
-		tls,
-		tikv.StoreStateDisconnected,
-		func(c context.Context, store *tikv.Store) error {
-			return tikv.Compact(c, tls, store.Address, level, rc.resourceGroupName)
+		rc.pdHTTPCli,
+		metapb.StoreState_Offline,
+		func(c context.Context, store *pdhttp.MetaStore) error {
+			return tikv.Compact(c, rc.tls, store.Address, level, rc.resourceGroupName)
 		},
 	)
 }
