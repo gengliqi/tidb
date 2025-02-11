@@ -28,7 +28,7 @@ import (
 	"github.com/pingcap/tidb/pkg/disttask/framework/testutil"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/sessionctx"
-	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
@@ -262,9 +262,9 @@ func TestSwitchTaskStep(t *testing.T) {
 		subtasksStepTwo[i] = proto.NewSubtask(proto.StepTwo, taskID, proto.TaskTypeExample,
 			":4000", 11, []byte(fmt.Sprintf("%d", i)), i+1)
 	}
-	require.NoError(t, tk.Session().GetSessionVars().SetSystemVar(variable.TiDBMemQuotaQuery, "1024"))
+	require.NoError(t, tk.Session().GetSessionVars().SetSystemVar(vardef.TiDBMemQuotaQuery, "1024"))
 	require.NoError(t, tm.SwitchTaskStep(ctx, task, proto.TaskStateRunning, proto.StepTwo, subtasksStepTwo))
-	value, ok := tk.Session().GetSessionVars().GetSystemVar(variable.TiDBMemQuotaQuery)
+	value, ok := tk.Session().GetSessionVars().GetSystemVar(vardef.TiDBMemQuotaQuery)
 	require.True(t, ok)
 	require.Equal(t, "1024", value)
 	task, err = tm.GetTaskByID(ctx, taskID)
@@ -518,10 +518,6 @@ func TestSubTaskTable(t *testing.T) {
 	require.Len(t, cntByStates, 1)
 	require.Equal(t, int64(1), cntByStates[proto.SubtaskStatePending])
 
-	ok, err := sm.HasSubtasksInStates(ctx, "tidb1", 1, proto.StepOne, proto.SubtaskStatePending)
-	require.NoError(t, err)
-	require.True(t, ok)
-
 	ts := time.Now()
 	time.Sleep(time.Second)
 	require.NoError(t, sm.StartSubtask(ctx, 1, "tidb1"))
@@ -555,14 +551,7 @@ func TestSubTaskTable(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(0), cntByStates[proto.SubtaskStatePending])
 
-	ok, err = sm.HasSubtasksInStates(ctx, "tidb1", 1, proto.StepOne, proto.SubtaskStatePending)
-	require.NoError(t, err)
-	require.False(t, ok)
 	require.NoError(t, testutil.DeleteSubtasksByTaskID(ctx, sm, 1))
-
-	ok, err = sm.HasSubtasksInStates(ctx, "tidb1", 1, proto.StepOne, proto.SubtaskStatePending, proto.SubtaskStateRunning)
-	require.NoError(t, err)
-	require.False(t, ok)
 
 	testutil.CreateSubTask(t, sm, 2, proto.StepOne, "tidb1", []byte("test"), proto.TaskTypeExample, 11)
 
@@ -1191,4 +1180,8 @@ func TestGetActiveTaskExecInfo(t *testing.T) {
 	require.Equal(t, 6, taskExecInfos[1].SubtaskConcurrency)
 	checkBasicTaskEq(t, &tasks[3].TaskBase, taskExecInfos[2].TaskBase)
 	require.Equal(t, 8, taskExecInfos[2].SubtaskConcurrency)
+	// :4002, no such subtasks
+	taskExecInfos, err = tm.GetTaskExecInfoByExecID(ctx, ":4002")
+	require.NoError(t, err)
+	require.Empty(t, taskExecInfos)
 }

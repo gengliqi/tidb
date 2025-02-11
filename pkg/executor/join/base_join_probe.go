@@ -185,6 +185,7 @@ func (j *baseJoinProbe) SetChunkForProbe(chk *chunk.Chunk) (err error) {
 			return errors.New("Previous chunk is not probed yet")
 		}
 	}
+
 	j.currentChunk = chk
 	logicalRows := chk.NumRows()
 	// if chk.sel != nil, then physicalRows is different from logicalRows
@@ -312,6 +313,20 @@ func (j *baseJoinProbe) SetChunkForProbe(chk *chunk.Chunk) (err error) {
 }
 
 func (j *baseJoinProbe) SetRestoredChunkForProbe(chk *chunk.Chunk) error {
+	defer func() {
+		if j.ctx.spillHelper.areAllPartitionsSpilled() {
+			// We will not call `Probe` function when all partitions are spilled.
+			// So it's necessary to manually set `currentProbeRow` to avoid check fail.
+			j.currentProbeRow = j.chunkRows
+		}
+	}()
+
+	if j.currentChunk != nil {
+		if j.currentProbeRow < j.chunkRows {
+			return errors.New("Previous chunk is not probed yet")
+		}
+	}
+
 	hashValueCol := chk.Column(0)
 	serializedKeysCol := chk.Column(1)
 	colNum := chk.NumCols()
@@ -768,14 +783,27 @@ func NewJoinProbe(ctx *HashJoinCtxV2, workID uint, joinType logicalop.JoinType, 
 			panic("len(base.rUsed) != 0 for semi join")
 		}
 		return newSemiJoinProbe(base, !rightAsBuildSide)
+	case logicalop.AntiSemiJoin:
+		if len(base.rUsed) != 0 {
+			panic("len(base.rUsed) != 0 for anti semi join")
+		}
+		return newAntiSemiJoinProbe(base, !rightAsBuildSide)
 	case logicalop.LeftOuterSemiJoin:
 		if len(base.rUsed) != 0 {
 			panic("len(base.rUsed) != 0 for left outer semi join")
 		}
 		if rightAsBuildSide {
-			return newLeftOuterSemiJoinProbe(base)
+			return newLeftOuterSemiJoinProbe(base, false)
 		}
-		fallthrough
+		panic("unsupported join type")
+	case logicalop.AntiLeftOuterSemiJoin:
+		if len(base.rUsed) != 0 {
+			panic("len(base.rUsed) != 0 for left outer anti semi join")
+		}
+		if rightAsBuildSide {
+			return newLeftOuterSemiJoinProbe(base, true)
+		}
+		panic("unsupported join type")
 	default:
 		panic("unsupported join type")
 	}

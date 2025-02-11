@@ -26,7 +26,7 @@ import (
 	"github.com/pingcap/tidb/pkg/disttask/framework/proto"
 	"github.com/pingcap/tidb/pkg/kv"
 	"github.com/pingcap/tidb/pkg/sessionctx"
-	"github.com/pingcap/tidb/pkg/sessionctx/variable"
+	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/util"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
@@ -268,27 +268,55 @@ func (mgr *TaskManager) GetTopUnfinishedTasks(ctx context.Context) ([]*proto.Tas
 
 // GetTaskExecInfoByExecID implements the scheduler.TaskManager interface.
 func (mgr *TaskManager) GetTaskExecInfoByExecID(ctx context.Context, execID string) ([]*TaskExecInfo, error) {
-	rs, err := mgr.ExecuteSQLWithNewSession(ctx,
-		`select `+basicTaskColumns+`, max(st.concurrency)
-			from mysql.tidb_global_task t join mysql.tidb_background_subtask st
-				on t.id = st.task_key and t.step = st.step
-			where t.state in (%?, %?, %?) and st.state in (%?, %?) and st.exec_id = %?
-			group by t.id
+	var res []*TaskExecInfo
+	err := mgr.WithNewSession(func(se sessionctx.Context) error {
+		// as the task will not go into next step when there are subtasks in those
+		// states, so their steps will be current step of their corresponding task,
+		// so we don't need to query by step here.
+		rs, err := sqlexec.ExecSQL(ctx, se.GetSQLExecutor(),
+			`select st.task_key, max(st.concurrency) from mysql.tidb_background_subtask st
+			where st.exec_id = %? and st.state in (%?, %?)
+			group by st.task_key`,
+			execID, proto.SubtaskStatePending, proto.SubtaskStateRunning)
+		if err != nil {
+			return err
+		}
+		if len(rs) == 0 {
+			return nil
+		}
+		maxSubtaskCon := make(map[int64]int, len(rs))
+		var taskIDsBuf strings.Builder
+		for i, r := range rs {
+			taskIDStr := r.GetString(0)
+			taskID, err2 := strconv.ParseInt(taskIDStr, 10, 0)
+			if err2 != nil {
+				return errors.Trace(err2)
+			}
+			maxSubtaskCon[taskID] = int(r.GetInt64(1))
+			if i > 0 {
+				taskIDsBuf.WriteString(",")
+			}
+			taskIDsBuf.WriteString(taskIDStr)
+		}
+		rs, err = sqlexec.ExecSQL(ctx, se.GetSQLExecutor(),
+			`select `+basicTaskColumns+` from mysql.tidb_global_task t
+			where t.id in (`+taskIDsBuf.String()+`) and t.state in (%?, %?, %?)
 			order by priority asc, create_time asc, id asc`,
-		proto.TaskStateRunning, proto.TaskStateReverting, proto.TaskStatePausing,
-		proto.SubtaskStatePending, proto.SubtaskStateRunning, execID)
-	if err != nil {
-		return nil, err
-	}
-
-	res := make([]*TaskExecInfo, 0, len(rs))
-	for _, r := range rs {
-		res = append(res, &TaskExecInfo{
-			TaskBase:           row2TaskBasic(r),
-			SubtaskConcurrency: int(r.GetInt64(9)),
-		})
-	}
-	return res, nil
+			proto.TaskStateRunning, proto.TaskStateReverting, proto.TaskStatePausing)
+		if err != nil {
+			return err
+		}
+		res = make([]*TaskExecInfo, 0, len(rs))
+		for _, r := range rs {
+			taskBase := row2TaskBasic(r)
+			res = append(res, &TaskExecInfo{
+				TaskBase:           taskBase,
+				SubtaskConcurrency: maxSubtaskCon[taskBase.ID],
+			})
+		}
+		return nil
+	})
+	return res, err
 }
 
 // GetTasksInStates gets the tasks in the states(order by priority asc, create_time acs, id asc).
@@ -567,22 +595,6 @@ func (mgr *TaskManager) GetSubtaskErrors(ctx context.Context, taskID int64) ([]e
 	return subTaskErrors, nil
 }
 
-// HasSubtasksInStates checks if there are subtasks in the states.
-func (mgr *TaskManager) HasSubtasksInStates(ctx context.Context, tidbID string, taskID int64, step proto.Step, states ...proto.SubtaskState) (bool, error) {
-	args := []any{tidbID, taskID, step}
-	for _, state := range states {
-		args = append(args, state)
-	}
-	rs, err := mgr.ExecuteSQLWithNewSession(ctx, `select 1 from mysql.tidb_background_subtask
-		where exec_id = %? and task_key = %? and step = %?
-			and state in (`+strings.Repeat("%?,", len(states)-1)+"%?) limit 1", args...)
-	if err != nil {
-		return false, err
-	}
-
-	return len(rs) > 0, nil
-}
-
 // UpdateSubtasksExecIDs update subtasks' execID.
 func (mgr *TaskManager) UpdateSubtasksExecIDs(ctx context.Context, subtasks []*proto.SubtaskBase) error {
 	// skip the update process.
@@ -615,14 +627,14 @@ func (mgr *TaskManager) SwitchTaskStep(
 ) error {
 	return mgr.WithNewTxn(ctx, func(se sessionctx.Context) error {
 		vars := se.GetSessionVars()
-		if vars.MemQuotaQuery < variable.DefTiDBMemQuotaQuery {
+		if vars.MemQuotaQuery < vardef.DefTiDBMemQuotaQuery {
 			bak := vars.MemQuotaQuery
-			if err := vars.SetSystemVar(variable.TiDBMemQuotaQuery,
-				strconv.Itoa(variable.DefTiDBMemQuotaQuery)); err != nil {
+			if err := vars.SetSystemVar(vardef.TiDBMemQuotaQuery,
+				strconv.Itoa(vardef.DefTiDBMemQuotaQuery)); err != nil {
 				return err
 			}
 			defer func() {
-				_ = vars.SetSystemVar(variable.TiDBMemQuotaQuery, strconv.Itoa(int(bak)))
+				_ = vars.SetSystemVar(vardef.TiDBMemQuotaQuery, strconv.Itoa(int(bak)))
 			}()
 		}
 		err := mgr.updateTaskStateStep(ctx, se, task, nextState, nextStep)
