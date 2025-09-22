@@ -1336,7 +1336,7 @@ const (
 )
 
 func (worker *copIteratorWorker) logTimeCopTask(costTime time.Duration, task *copTask, bo *Backoffer, resp *coprocessor.Response) {
-	logStr := fmt.Sprintf("[TIME_COP_PROCESS] resp_time:%s txnStartTS:%d region_id:%d store_addr:%s range:%s", costTime, worker.req.StartTs, task.region.GetID(), task.storeAddr, task.ranges.String())
+	logStr := fmt.Sprintf("[TIME_COP_PROCESS] resp_time:%s txnStartTS:%d region_id:%d store_addr:%s range:%s, paging:%d", costTime, worker.req.StartTs, task.region.GetID(), task.storeAddr, task.ranges.String(), worker.req.Paging.Enable)
 	if worker.kvclient.Stats != nil {
 		logStr += fmt.Sprintf(" stats:%s", worker.kvclient.Stats.String())
 	}
