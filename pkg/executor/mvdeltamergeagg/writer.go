@@ -19,6 +19,7 @@ import (
 	"math/bits"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/types"
 )
 
@@ -41,6 +42,16 @@ type tableResultWriter struct {
 	touched []bool
 	// prevTouched caches touched indexes from previous update row.
 	prevTouched []int
+
+	stats *mvDeltaMergeAggWriterStats
+}
+
+type writerRuntimeStatsAware interface {
+	setRuntimeStats(*mvDeltaMergeAggWriterStats)
+}
+
+func (w *tableResultWriter) setRuntimeStats(stats *mvDeltaMergeAggWriterStats) {
+	w.stats = stats
 }
 
 func (e *Exec) buildTableResultWriter() (ResultWriter, error) {
@@ -140,9 +151,18 @@ func (e *Exec) buildTableResultWriter() (ResultWriter, error) {
 }
 
 func (w *tableResultWriter) WriteChunk(_ context.Context, result *ChunkResult) error {
+	stats := w.stats
+	if stats == nil {
+		// Keep a single write path and avoid nil checks in the hot loop.
+		var tmpStats mvDeltaMergeAggWriterStats
+		stats = &tmpStats
+	}
+	stats.chunks++
+	stats.rowOps += int64(len(result.RowOps))
 	if len(result.RowOps) == 0 {
 		return nil
 	}
+
 	if err := w.validateChunkResult(result); err != nil {
 		return err
 	}
@@ -151,36 +171,75 @@ func (w *tableResultWriter) WriteChunk(_ context.Context, result *ChunkResult) e
 	if err != nil {
 		return err
 	}
+
 	tableCtx := w.exec.Ctx().GetTableCtx()
 	stmtCtx := w.exec.Ctx().GetSessionVars().StmtCtx
+	sessVars := w.exec.Ctx().GetSessionVars()
+	insertSizeHintStep := int(sessVars.ShardAllocateStep)
+	if insertSizeHintStep <= 0 {
+		insertSizeHintStep = 1
+	}
+	insertRemain := 0
+	for _, op := range result.RowOps {
+		if op.Tp == RowOpInsert {
+			insertRemain++
+		}
+	}
+	insertOrdinal := 0
 
 	for _, op := range result.RowOps {
 		switch op.Tp {
 		case RowOpNoOp:
+			stats.noopRows++
 			continue
 		case RowOpInsert:
+			stats.insertRows++
 			w.buildInsertRow(result, op.RowIdx)
-			_, err = w.exec.TargetTable.AddRecord(tableCtx, txn, w.newRow)
+
+			sizeHint := 0
+			if insertOrdinal%insertSizeHintStep == 0 {
+				sizeHint = min(insertSizeHintStep, insertRemain)
+			}
+			insertOrdinal++
+			insertRemain--
+			if sizeHint > 0 {
+				_, err = w.exec.TargetTable.AddRecord(
+					tableCtx,
+					txn,
+					w.newRow,
+					table.WithReserveAutoIDHint(sizeHint),
+					table.DupKeyCheckLazy,
+				)
+			} else {
+				_, err = w.exec.TargetTable.AddRecord(tableCtx, txn, w.newRow, table.DupKeyCheckLazy)
+			}
 			if err != nil {
 				return err
 			}
 		case RowOpUpdate:
+			stats.updateRows++
 			w.buildUpdateRows(result, op.RowIdx)
+
 			updateOrdinal := int(op.updateOrdinal)
 			w.buildTouchedFromBitmap(result.UpdateTouchedBitmap, result.UpdateTouchedStride, updateOrdinal)
+
 			handle, err := w.exec.TargetHandleCols.BuildHandle(stmtCtx, result.Input.GetRow(op.RowIdx))
 			if err != nil {
 				return err
 			}
+
 			if err := w.exec.TargetTable.UpdateRecord(tableCtx, txn, handle, w.oldRow, w.newRow, w.touched); err != nil {
 				return err
 			}
 		case RowOpDelete:
+			stats.deleteRows++
 			w.buildDeleteRow(result, op.RowIdx)
+
 			handle, err := w.exec.TargetHandleCols.BuildHandle(stmtCtx, result.Input.GetRow(op.RowIdx))
 			if err != nil {
 				return err
 			}
+
 			if err := w.exec.TargetTable.RemoveRecord(tableCtx, txn, handle, w.oldRow); err != nil {
 				return err
 			}
@@ -188,6 +247,7 @@ func (w *tableResultWriter) WriteChunk(_ context.Context, result *ChunkResult) e
 			return errors.Errorf("unknown MVDeltaMergeAgg row op %d", op.Tp)
 		}
 	}
+
 	return txn.MayFlush()
 }
 
