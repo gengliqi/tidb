@@ -25,6 +25,7 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	pmodel "github.com/pingcap/tidb/pkg/parser/model"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/parser/opcode"
 	"github.com/pingcap/tidb/pkg/planner/core"
 	corebase "github.com/pingcap/tidb/pkg/planner/core/base"
 	"github.com/pingcap/tidb/pkg/planner/core/resolve"
@@ -366,6 +367,86 @@ func TestBuildMLogDeltaSelectTiFlashHint(t *testing.T) {
 			require.Equal(t, item.DBName.L, tableHint.Tables[0].DBName.L)
 		})
 	}
+}
+
+func TestBuildMergeSourceSelectJoinOperatorByMVNullability(t *testing.T) {
+	sctx := core.MockContext()
+
+	baseID := int64(4011)
+	mlogID := int64(4022)
+	mvID := int64(4033)
+
+	base := &model.TableInfo{
+		ID:    baseID,
+		Name:  pmodel.NewCIStr("t"),
+		State: model.StatePublic,
+		Columns: []*model.ColumnInfo{
+			mkCol(1, "a", 0, mysql.TypeLong),
+			mkCol(2, "b", 1, mysql.TypeLong),
+		},
+		MaterializedViewBase: &model.MaterializedViewBaseInfo{MLogID: mlogID},
+	}
+	mlog := &model.TableInfo{
+		ID:    mlogID,
+		Name:  pmodel.NewCIStr("$mlog$t"),
+		State: model.StatePublic,
+		Columns: []*model.ColumnInfo{
+			mkCol(1, "a", 0, mysql.TypeLong),
+			mkCol(2, "b", 1, mysql.TypeLong),
+			mkCol(3, model.MaterializedViewLogDMLTypeColumnName, 2, mysql.TypeVarchar),
+			mkCol(4, model.MaterializedViewLogOldNewColumnName, 3, mysql.TypeTiny),
+		},
+		MaterializedViewLog: &model.MaterializedViewLogInfo{
+			BaseTableID: baseID,
+			Columns:     []pmodel.CIStr{pmodel.NewCIStr("a"), pmodel.NewCIStr("b")},
+		},
+	}
+	mv := &model.TableInfo{
+		ID:    mvID,
+		Name:  pmodel.NewCIStr("mv_tbl"),
+		State: model.StatePublic,
+		Columns: []*model.ColumnInfo{
+			mkCol(1, "x", 0, mysql.TypeLong),
+			mkCol(2, "y", 1, mysql.TypeLong),
+			mkCol(3, "cnt", 2, mysql.TypeLonglong),
+		},
+		MaterializedView: &model.MaterializedViewInfo{
+			BaseTableIDs: []int64{baseID},
+			SQLContent:   "select a, b, count(1) from t group by a, b",
+		},
+	}
+	mv.Columns[0].FieldType.AddFlag(mysql.NotNullFlag)
+
+	is := infoschema.MockInfoSchema([]*model.TableInfo{base, mlog, mv})
+	domain.GetDomain(sctx).MockInfoCacheAndLoadInfoSchema(is)
+
+	res, err := mvmerge.Build(
+		sctx.GetPlanCtx(),
+		is,
+		mv,
+		mvmerge.BuildOptions{FromTS: 10},
+		nil,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, res.MergeSourceSelect)
+	require.NotNil(t, res.MergeSourceSelect.From)
+	require.NotNil(t, res.MergeSourceSelect.From.TableRefs)
+	require.NotNil(t, res.MergeSourceSelect.From.TableRefs.On)
+
+	predicates := collectAndPredicates(t, res.MergeSourceSelect.From.TableRefs.On.Expr)
+	require.Len(t, predicates, 2)
+
+	opByMVCol := make(map[string]opcode.Op, len(predicates))
+	for _, pred := range predicates {
+		leftTable, leftCol := columnNameRef(t, pred.L)
+		rightTable, rightCol := columnNameRef(t, pred.R)
+		require.Equal(t, deltaTableAlias, leftTable)
+		require.Equal(t, mvTableAlias, rightTable)
+		require.Equal(t, leftCol, rightCol)
+		opByMVCol[rightCol] = pred.Op
+	}
+	require.Equal(t, opcode.EQ, opByMVCol["x"])
+	require.Equal(t, opcode.NullEQ, opByMVCol["y"])
 }
 
 func TestBuildMinMaxHasRemovedGate(t *testing.T) {
@@ -829,4 +910,23 @@ func requireOutputColNames(t *testing.T, outputNames types.NameSlice, expected [
 	for i, colName := range expected {
 		require.Equal(t, colName, outputNames[i].ColName.O)
 	}
+}
+
+func collectAndPredicates(t *testing.T, expr ast.ExprNode) []*ast.BinaryOperationExpr {
+	t.Helper()
+
+	bin, ok := expr.(*ast.BinaryOperationExpr)
+	require.True(t, ok)
+	if bin.Op != opcode.LogicAnd {
+		return []*ast.BinaryOperationExpr{bin}
+	}
+	return append(collectAndPredicates(t, bin.L), collectAndPredicates(t, bin.R)...)
+}
+
+func columnNameRef(t *testing.T, expr ast.ExprNode) (string, string) {
+	t.Helper()
+
+	col, ok := expr.(*ast.ColumnNameExpr)
+	require.True(t, ok)
+	return col.Name.Table.O, col.Name.Name.O
 }

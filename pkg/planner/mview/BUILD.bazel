@@ -28,7 +28,7 @@ go_test(
     timeout = "short",
     srcs = ["mvmerge_test.go"],
     flaky = True,
-    shard_count = 8,
+    shard_count = 9,
     deps = [
         ":mview",
         "//pkg/domain",
@@ -37,6 +37,7 @@ go_test(
         "//pkg/parser/ast",
         "//pkg/parser/model",
         "//pkg/parser/mysql",
+        "//pkg/parser/opcode",
         "//pkg/planner/core",
         "//pkg/planner/core/base",
         "//pkg/planner/core/resolve",

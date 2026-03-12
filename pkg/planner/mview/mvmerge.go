@@ -340,7 +340,7 @@ func buildLocal(
 //	  <stage-1 delta aggregation on mlog>
 //	) AS delta
 //	LEFT JOIN <mv table> AS mv
-//	  ON delta.<group_key_1> <=> mv.<group_key_1>
+//	  ON delta.<group_key_1> [= | <=>] mv.<group_key_1>
 //	 AND ...
 //
 // Stage-1 delta columns are always contiguous at the beginning of output schema, so aggregate
@@ -1306,10 +1306,11 @@ func buildMLogDeltaSelect(
 //	  mv._tidb_rowid AS __mvmerge_mv_rowid  -- only for extra row-id handle tables
 //	FROM (<stage-1 delta select>) AS delta
 //	LEFT JOIN <db>.<mv> AS mv
-//	  ON delta.<group_key_1> <=> mv.<group_key_1>
+//	  ON delta.<group_key_1> [= | <=>] mv.<group_key_1>
 //	 AND ...
 //
-// Null-safe equality (<=>) keeps SQL NULL-group semantics consistent with GROUP BY keys.
+// Nullable MV group keys keep null-safe equality (<=>) so NULL-group semantics stay consistent
+// with GROUP BY. When the MV-side group key is NOT NULL, regular equality (=) is equivalent.
 // Delta is placed on the left side so every changed group survives even when MV row does not exist yet.
 func buildMergeSourceSelect(
 	dbName pmodel.CIStr,
@@ -1326,13 +1327,19 @@ func buildMergeSourceSelect(
 		AsName: pmodel.NewCIStr(mvTableAlias),
 	}
 
-	// Build null-safe join conditions on group keys.
+	// Build join conditions on group keys. Nullable MV keys need <=> to preserve NULL-group
+	// semantics; NOT NULL MV keys can use regular equality.
 	var onExpr ast.ExprNode
 	for _, mvOffset := range groupKeyOffsets {
-		colName := mvCols[mvOffset].Name
+		mvColInfo := mvCols[mvOffset]
+		colName := mvColInfo.Name
 		deltaCol := qualColExpr(deltaTableAlias, colName.O)
 		mvCol := qualColExpr(mvTableAlias, colName.O)
-		cmp := binary(opcode.NullEQ, deltaCol, mvCol)
+		op := opcode.NullEQ
+		if mysql.HasNotNullFlag(mvColInfo.GetFlag()) {
+			op = opcode.EQ
+		}
+		cmp := binary(op, deltaCol, mvCol)
 		if onExpr == nil {
 			onExpr = cmp
 		} else {
