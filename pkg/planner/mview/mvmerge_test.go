@@ -268,6 +268,106 @@ func TestBuildCountExprSumExpr(t *testing.T) {
 	})
 }
 
+func TestBuildMLogDeltaSelectTiFlashHint(t *testing.T) {
+	sctx := core.MockContext()
+
+	baseID := int64(1011)
+	mlogID := int64(2022)
+	mvID := int64(3033)
+
+	base := &model.TableInfo{
+		ID:    baseID,
+		Name:  pmodel.NewCIStr("t"),
+		State: model.StatePublic,
+		Columns: []*model.ColumnInfo{
+			mkCol(1, "a", 0, mysql.TypeLong),
+			mkCol(2, "b", 1, mysql.TypeLong),
+		},
+		MaterializedViewBase: &model.MaterializedViewBaseInfo{MLogID: mlogID},
+	}
+	mlog := &model.TableInfo{
+		ID:    mlogID,
+		Name:  pmodel.NewCIStr("$mlog$t"),
+		State: model.StatePublic,
+		Columns: []*model.ColumnInfo{
+			mkCol(1, "a", 0, mysql.TypeLong),
+			mkCol(2, "b", 1, mysql.TypeLong),
+			mkCol(3, model.MaterializedViewLogDMLTypeColumnName, 2, mysql.TypeVarchar),
+			mkCol(4, model.MaterializedViewLogOldNewColumnName, 3, mysql.TypeTiny),
+		},
+		MaterializedViewLog: &model.MaterializedViewLogInfo{
+			BaseTableID: baseID,
+			Columns:     []pmodel.CIStr{pmodel.NewCIStr("a"), pmodel.NewCIStr("b")},
+		},
+	}
+	mv := &model.TableInfo{
+		ID:    mvID,
+		Name:  pmodel.NewCIStr("mv_tbl"),
+		State: model.StatePublic,
+		Columns: []*model.ColumnInfo{
+			mkCol(1, "x", 0, mysql.TypeLong),
+			mkCol(2, "cnt", 1, mysql.TypeLonglong),
+		},
+		MaterializedView: &model.MaterializedViewInfo{
+			BaseTableIDs: []int64{baseID},
+			SQLContent:   "select a, count(1) from t group by a",
+		},
+	}
+
+	testCases := []struct {
+		name           string
+		tiFlashReplica *model.TiFlashReplicaInfo
+	}{
+		{
+			name:           "available replica keeps hint",
+			tiFlashReplica: &model.TiFlashReplicaInfo{Count: 1, Available: true},
+		},
+		{
+			name:           "missing replica still keeps hint",
+			tiFlashReplica: nil,
+		},
+		{
+			name:           "unavailable replica still keeps hint",
+			tiFlashReplica: &model.TiFlashReplicaInfo{Count: 1, Available: false},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mlogClone := *mlog
+			mlogClone.TiFlashReplica = tc.tiFlashReplica
+			is := infoschema.MockInfoSchema([]*model.TableInfo{base, &mlogClone, mv})
+			domain.GetDomain(sctx).MockInfoCacheAndLoadInfoSchema(is)
+
+			res, err := mvmerge.Build(
+				sctx.GetPlanCtx(),
+				is,
+				mv,
+				mvmerge.BuildOptions{FromTS: 10},
+				nil,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, res.MergeSourceSelect)
+			require.NotNil(t, res.MergeSourceSelect.From)
+			require.NotNil(t, res.MergeSourceSelect.From.TableRefs)
+
+			deltaSrc, ok := res.MergeSourceSelect.From.TableRefs.Left.(*ast.TableSource)
+			require.True(t, ok)
+			deltaSel, ok := deltaSrc.Source.(*ast.SelectStmt)
+			require.True(t, ok)
+			require.Len(t, deltaSel.TableHints, 1)
+			tableHint := deltaSel.TableHints[0]
+			require.Equal(t, hint.HintReadFromStorage, tableHint.HintName.L)
+			require.Equal(t, hint.HintTiFlash, tableHint.HintData.(pmodel.CIStr).L)
+			require.Len(t, tableHint.Tables, 1)
+			require.Equal(t, mlogClone.Name.L, tableHint.Tables[0].TableName.L)
+			item, ok := is.TableItemByID(mlogClone.ID)
+			require.True(t, ok)
+			require.Equal(t, item.DBName.L, tableHint.Tables[0].DBName.L)
+		})
+	}
+}
+
 func TestBuildMinMaxHasRemovedGate(t *testing.T) {
 	sctx := core.MockContext()
 	sctx.GetSessionVars().EnableINLJoinInnerMultiPattern = true

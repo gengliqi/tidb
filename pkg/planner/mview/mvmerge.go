@@ -32,6 +32,7 @@ import (
 	"github.com/pingcap/tidb/pkg/planner/planctx"
 	plannerutil "github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/table/tables"
+	utilhint "github.com/pingcap/tidb/pkg/util/hint"
 )
 
 const (
@@ -1273,11 +1274,24 @@ func buildMLogDeltaSelect(
 	if err != nil {
 		return nil, err
 	}
+	tableHints := []*ast.TableOptimizerHint{
+		{
+			HintName: pmodel.NewCIStr(utilhint.HintReadFromStorage),
+			HintData: pmodel.NewCIStr(utilhint.HintTiFlash),
+			Tables: []ast.HintTable{
+				{
+					DBName:    dbName,
+					TableName: mlogTable.Name,
+				},
+			},
+		},
+	}
 	return &ast.SelectStmt{
-		Fields:  &ast.FieldList{Fields: phase1Fields},
-		From:    mlogFrom,
-		Where:   phase1Where,
-		GroupBy: groupBy,
+		Fields:     &ast.FieldList{Fields: phase1Fields},
+		From:       mlogFrom,
+		Where:      phase1Where,
+		GroupBy:    groupBy,
+		TableHints: tableHints,
 	}, nil
 }
 

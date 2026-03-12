@@ -1879,5 +1879,4 @@ func TestMVServiceGlobalSysVars(t *testing.T) {
 
 	require.NoError(t, mock.SetGlobalSysVar(context.Background(), TiDBMLogPurgeHistTime, "48"))
 	require.Equal(t, 48*time.Hour, gotPurgeHist)
-
 }
