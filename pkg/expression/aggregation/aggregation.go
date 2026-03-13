@@ -88,6 +88,22 @@ func NewDistAggFunc(expr *tipb.Expr, fieldTps []*types.FieldType, ctx expression
 		aggF := newAggFunc(ast.AggFuncMin, args, false)
 		aggF.Mode = AggFunctionMode(*expr.AggFuncMode)
 		return &maxMinFunction{aggFunction: aggF, ctor: collate.GetCollator(args[0].GetType(ctx.GetEvalCtx()).GetCollate())}, aggF.AggFuncDesc, nil
+	case tipb.ExprType_MaxCount:
+		aggF := newAggFunc(ast.AggFuncMaxCount, args, false)
+		aggF.Mode = AggFunctionMode(*expr.AggFuncMode)
+		cmpArgIdx := 0
+		if (aggF.Mode == FinalMode || aggF.Mode == Partial2Mode) && len(args) > 1 {
+			cmpArgIdx = 1
+		}
+		return &maxMinCountFunction{aggFunction: aggF, isMax: true, ctor: collate.GetCollator(args[cmpArgIdx].GetType(ctx.GetEvalCtx()).GetCollate())}, aggF.AggFuncDesc, nil
+	case tipb.ExprType_MinCount:
+		aggF := newAggFunc(ast.AggFuncMinCount, args, false)
+		aggF.Mode = AggFunctionMode(*expr.AggFuncMode)
+		cmpArgIdx := 0
+		if (aggF.Mode == FinalMode || aggF.Mode == Partial2Mode) && len(args) > 1 {
+			cmpArgIdx = 1
+		}
+		return &maxMinCountFunction{aggFunction: aggF, isMax: false, ctor: collate.GetCollator(args[cmpArgIdx].GetType(ctx.GetEvalCtx()).GetCollate())}, aggF.AggFuncDesc, nil
 	case tipb.ExprType_First:
 		aggF := newAggFunc(ast.AggFuncFirstRow, args, false)
 		aggF.Mode = AggFunctionMode(*expr.AggFuncMode)
@@ -242,9 +258,16 @@ func CheckAggPushDown(ctx expression.EvalContext, aggFunc *AggFuncDesc, storeTyp
 	if len(aggFunc.OrderByItems) > 0 && aggFunc.Name != ast.AggFuncGroupConcat {
 		return false
 	}
-	// max_count/min_count are currently implemented only in TiDB.
 	if aggFunc.Name == ast.AggFuncMaxCount || aggFunc.Name == ast.AggFuncMinCount {
-		return false
+		// TiFlash currently supports max_count/min_count only in one-stage aggregation.
+		// In planner, max_count/min_count may carry Final/Partial2 mode while still using
+		// the one-stage single-arg shape. The true two-stage shape is [count, extrema value].
+		if storeType != kv.TiFlash {
+			return false
+		}
+		if (aggFunc.Mode == FinalMode || aggFunc.Mode == Partial2Mode) && len(aggFunc.Args) > 1 {
+			return false
+		}
 	}
 	if aggFunc.Name == ast.AggFuncApproxPercentile {
 		return false
@@ -290,7 +313,7 @@ func CheckAggPushFlash(ctx expression.EvalContext, aggFunc *AggFuncDesc) bool {
 		}
 	}
 	switch aggFunc.Name {
-	case ast.AggFuncCount, ast.AggFuncMin, ast.AggFuncMax, ast.AggFuncFirstRow, ast.AggFuncApproxCountDistinct:
+	case ast.AggFuncCount, ast.AggFuncMin, ast.AggFuncMax, ast.AggFuncMaxCount, ast.AggFuncMinCount, ast.AggFuncFirstRow, ast.AggFuncApproxCountDistinct:
 		return true
 	case ast.AggFuncSum, ast.AggFuncSumInt, ast.AggFuncAvg, ast.AggFuncGroupConcat:
 		// Now tiflash doesn't support CastJsonAsReal and CastJsonAsString.

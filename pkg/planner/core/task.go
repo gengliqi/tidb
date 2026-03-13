@@ -1586,6 +1586,15 @@ func (p *basePhysicalAgg) convertAvgForMPP() *PhysicalProjection {
 }
 
 func (p *basePhysicalAgg) newPartialAggregate(copTaskType kv.StoreType, isMPPTask bool) (partial, final base.PhysicalPlan) {
+	// max_count/min_count currently support only one-stage execution on TiFlash.
+	// Do not split them into partial/final here.
+	if copTaskType == kv.TiFlash {
+		for _, aggFunc := range p.AggFuncs {
+			if aggFunc.Name == ast.AggFuncMaxCount || aggFunc.Name == ast.AggFuncMinCount {
+				return nil, p.Self
+			}
+		}
+	}
 	// Check if this aggregation can push down.
 	if !CheckAggCanPushCop(p.SCtx(), p.AggFuncs, p.GroupByItems, copTaskType) {
 		return nil, p.Self
@@ -2268,6 +2277,28 @@ func (p *PhysicalHashAgg) attach2TaskForMpp(tasks ...base.Task) base.Task {
 		attachPlan2Task(finalAgg, t)
 		return t
 	case MppScalar:
+		hasTiFlashOnePhaseOnlyAgg := false
+		for _, aggFunc := range p.AggFuncs {
+			if aggFunc.Name == ast.AggFuncMaxCount || aggFunc.Name == ast.AggFuncMinCount {
+				hasTiFlashOnePhaseOnlyAgg = true
+				break
+			}
+		}
+		if hasTiFlashOnePhaseOnlyAgg {
+			prop := &property.PhysicalProperty{
+				TaskTp:         property.MppTaskType,
+				ExpectedCnt:    math.MaxFloat64,
+				MPPPartitionTp: property.SinglePartitionType,
+			}
+			if mpp.needEnforceExchanger(prop) {
+				newMpp := mpp.enforceExchanger(prop)
+				if newMpp.Invalid() {
+					return newMpp
+				}
+				mpp = newMpp
+			}
+			return p.attach2TaskForMpp1Phase(mpp)
+		}
 		prop := &property.PhysicalProperty{TaskTp: property.MppTaskType, ExpectedCnt: math.MaxFloat64, MPPPartitionTp: property.SinglePartitionType}
 		if !mpp.needEnforceExchanger(prop) {
 			// On the one hand: when the low layer already satisfied the single partition layout, just do the all agg computation in the single node.
