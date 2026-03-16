@@ -227,8 +227,12 @@ func (af *aggFunction) updateSum(ctx types.Context, evalCtx *AggEvaluateContext,
 
 // NeedCount indicates whether the aggregate function should record count.
 func NeedCount(name string) bool {
-	return name == ast.AggFuncCount || name == ast.AggFuncAvg ||
-		name == ast.AggFuncMaxCount || name == ast.AggFuncMinCount
+	return name == ast.AggFuncCount || name == ast.AggFuncAvg || IsMaxMinCount(name)
+}
+
+// IsMaxMinCount checks whether name is max_count/min_count.
+func IsMaxMinCount(name string) bool {
+	return name == ast.AggFuncMaxCount || name == ast.AggFuncMinCount
 }
 
 // NeedValue indicates whether the aggregate function should record value.
@@ -258,14 +262,19 @@ func CheckAggPushDown(ctx expression.EvalContext, aggFunc *AggFuncDesc, storeTyp
 	if len(aggFunc.OrderByItems) > 0 && aggFunc.Name != ast.AggFuncGroupConcat {
 		return false
 	}
-	if aggFunc.Name == ast.AggFuncMaxCount || aggFunc.Name == ast.AggFuncMinCount {
+	if IsMaxMinCount(aggFunc.Name) {
 		// TiFlash currently supports max_count/min_count only in one-stage aggregation.
-		// In planner, max_count/min_count may carry Final/Partial2 mode while still using
-		// the one-stage single-arg shape. The true two-stage shape is [count, extrema value].
+		// We accept only the one-stage shape (single argument) and modes used by planner
+		// for this shape. The true two-stage shape is [count, extrema value].
 		if storeType != kv.TiFlash {
 			return false
 		}
-		if (aggFunc.Mode == FinalMode || aggFunc.Mode == Partial2Mode) && len(aggFunc.Args) > 1 {
+		if len(aggFunc.Args) != 1 {
+			return false
+		}
+		switch aggFunc.Mode {
+		case CompleteMode, Partial1Mode, FinalMode, Partial2Mode:
+		default:
 			return false
 		}
 	}

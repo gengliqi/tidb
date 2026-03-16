@@ -1586,17 +1586,13 @@ func (p *basePhysicalAgg) convertAvgForMPP() *PhysicalProjection {
 }
 
 func (p *basePhysicalAgg) newPartialAggregate(copTaskType kv.StoreType, isMPPTask bool) (partial, final base.PhysicalPlan) {
-	// max_count/min_count currently support only one-stage execution on TiFlash.
-	// Do not split them into partial/final here.
-	if copTaskType == kv.TiFlash {
-		for _, aggFunc := range p.AggFuncs {
-			if aggFunc.Name == ast.AggFuncMaxCount || aggFunc.Name == ast.AggFuncMinCount {
-				return nil, p.Self
-			}
-		}
-	}
 	// Check if this aggregation can push down.
 	if !CheckAggCanPushCop(p.SCtx(), p.AggFuncs, p.GroupByItems, copTaskType) {
+		return nil, p.Self
+	}
+	// max_count/min_count currently support only one-stage execution on TiFlash.
+	// Do not split them into partial/final here.
+	if copTaskType == kv.TiFlash && hasTiFlashOnePhaseOnlyAggFunc(p.AggFuncs) {
 		return nil, p.Self
 	}
 	partialPref, finalPref, firstRowFuncMap := BuildFinalModeAggregation(p.SCtx(), &AggInfo{
@@ -1832,6 +1828,15 @@ func computePartialCursorOffset(name string) int {
 		offset++
 	}
 	return offset
+}
+
+func hasTiFlashOnePhaseOnlyAggFunc(aggFuncs []*aggregation.AggFuncDesc) bool {
+	for _, aggFunc := range aggFuncs {
+		if aggregation.IsMaxMinCount(aggFunc.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // Attach2Task implements PhysicalPlan interface.
@@ -2277,14 +2282,7 @@ func (p *PhysicalHashAgg) attach2TaskForMpp(tasks ...base.Task) base.Task {
 		attachPlan2Task(finalAgg, t)
 		return t
 	case MppScalar:
-		hasTiFlashOnePhaseOnlyAgg := false
-		for _, aggFunc := range p.AggFuncs {
-			if aggFunc.Name == ast.AggFuncMaxCount || aggFunc.Name == ast.AggFuncMinCount {
-				hasTiFlashOnePhaseOnlyAgg = true
-				break
-			}
-		}
-		if hasTiFlashOnePhaseOnlyAgg {
+		if hasTiFlashOnePhaseOnlyAggFunc(p.AggFuncs) {
 			prop := &property.PhysicalProperty{
 				TaskTp:         property.MppTaskType,
 				ExpectedCnt:    math.MaxFloat64,

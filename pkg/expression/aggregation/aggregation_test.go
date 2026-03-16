@@ -213,9 +213,16 @@ func TestCheckAggPushDownMaxMinCount(t *testing.T) {
 		require.False(t, CheckAggPushDown(ctx.GetExprCtx().GetEvalCtx(), finalDesc, kv.TiFlash))
 		finalDesc.Mode = Partial2Mode
 		require.False(t, CheckAggPushDown(ctx.GetExprCtx().GetEvalCtx(), finalDesc, kv.TiFlash))
+		finalDesc.Mode = CompleteMode
+		require.False(t, CheckAggPushDown(ctx.GetExprCtx().GetEvalCtx(), finalDesc, kv.TiFlash))
+		finalDesc.Mode = Partial1Mode
+		require.False(t, CheckAggPushDown(ctx.GetExprCtx().GetEvalCtx(), finalDesc, kv.TiFlash))
 
 		// Still denied on TiKV even if two-stage shape.
 		require.False(t, CheckAggPushDown(ctx.GetExprCtx().GetEvalCtx(), finalDesc, kv.TiKV))
+
+		desc.Mode = DedupMode
+		require.False(t, CheckAggPushDown(ctx.GetExprCtx().GetEvalCtx(), desc, kv.TiFlash))
 	}
 }
 

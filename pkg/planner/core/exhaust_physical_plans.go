@@ -2698,13 +2698,7 @@ func tryToGetMppHashAggs(la *logicalop.LogicalAggregation, prop *property.Physic
 	// Is this aggregate a final stage aggregate?
 	// Final agg can't be split into multi-stage aggregate
 	hasFinalAgg := len(la.AggFuncs) > 0 && la.AggFuncs[0].Mode == aggregation.FinalMode
-	hasTiFlashOnePhaseOnlyAgg := false
-	for _, aggFunc := range la.AggFuncs {
-		if aggFunc.Name == ast.AggFuncMaxCount || aggFunc.Name == ast.AggFuncMinCount {
-			hasTiFlashOnePhaseOnlyAgg = true
-			break
-		}
-	}
+	hasTiFlashOnePhaseOnlyAgg := hasTiFlashOnePhaseOnlyAggFunc(la.AggFuncs)
 	// count final agg should become sum for MPP execution path.
 	// In the traditional case, TiDB take up the final agg role and push partial agg to TiKV,
 	// while TiDB can tell the partialMode and do the sum computation rather than counting but MPP doesn't
