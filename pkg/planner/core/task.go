@@ -1592,7 +1592,7 @@ func (p *basePhysicalAgg) newPartialAggregate(copTaskType kv.StoreType, isMPPTas
 	}
 	// max_count/min_count currently support only one-stage execution on TiFlash.
 	// Do not split them into partial/final here.
-	if copTaskType == kv.TiFlash && hasTiFlashOnePhaseOnlyAggFunc(p.AggFuncs) {
+	if copTaskType == kv.TiFlash && containsMaxMinCountAgg(p.AggFuncs) {
 		return nil, p.Self
 	}
 	partialPref, finalPref, firstRowFuncMap := BuildFinalModeAggregation(p.SCtx(), &AggInfo{
@@ -1830,7 +1830,7 @@ func computePartialCursorOffset(name string) int {
 	return offset
 }
 
-func hasTiFlashOnePhaseOnlyAggFunc(aggFuncs []*aggregation.AggFuncDesc) bool {
+func containsMaxMinCountAgg(aggFuncs []*aggregation.AggFuncDesc) bool {
 	for _, aggFunc := range aggFuncs {
 		if aggregation.IsMaxMinCount(aggFunc.Name) {
 			return true
@@ -2282,7 +2282,7 @@ func (p *PhysicalHashAgg) attach2TaskForMpp(tasks ...base.Task) base.Task {
 		attachPlan2Task(finalAgg, t)
 		return t
 	case MppScalar:
-		if hasTiFlashOnePhaseOnlyAggFunc(p.AggFuncs) {
+		if containsMaxMinCountAgg(p.AggFuncs) {
 			prop := &property.PhysicalProperty{
 				TaskTp:         property.MppTaskType,
 				ExpectedCnt:    math.MaxFloat64,

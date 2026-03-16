@@ -264,17 +264,14 @@ func CheckAggPushDown(ctx expression.EvalContext, aggFunc *AggFuncDesc, storeTyp
 	}
 	if IsMaxMinCount(aggFunc.Name) {
 		// TiFlash currently supports max_count/min_count only in one-stage aggregation.
-		// We accept only the one-stage shape (single argument) and modes used by planner
-		// for this shape. The true two-stage shape is [count, extrema value].
+		// The true two-stage shape is [count, extrema value].
 		if storeType != kv.TiFlash {
 			return false
 		}
 		if len(aggFunc.Args) != 1 {
 			return false
 		}
-		switch aggFunc.Mode {
-		case CompleteMode, Partial1Mode, FinalMode, Partial2Mode:
-		default:
+		if aggFunc.Mode == DedupMode {
 			return false
 		}
 	}

@@ -2698,7 +2698,7 @@ func tryToGetMppHashAggs(la *logicalop.LogicalAggregation, prop *property.Physic
 	// Is this aggregate a final stage aggregate?
 	// Final agg can't be split into multi-stage aggregate
 	hasFinalAgg := len(la.AggFuncs) > 0 && la.AggFuncs[0].Mode == aggregation.FinalMode
-	hasTiFlashOnePhaseOnlyAgg := hasTiFlashOnePhaseOnlyAggFunc(la.AggFuncs)
+	containsMaxMinCount := containsMaxMinCountAgg(la.AggFuncs)
 	// count final agg should become sum for MPP execution path.
 	// In the traditional case, TiDB take up the final agg role and push partial agg to TiKV,
 	// while TiDB can tell the partialMode and do the sum computation rather than counting but MPP doesn't
@@ -2765,26 +2765,24 @@ func tryToGetMppHashAggs(la *logicalop.LogicalAggregation, prop *property.Physic
 			}
 		}
 
-		// Final agg can't be split into multi-stage aggregate, so exit early
-		if hasFinalAgg {
+		// Final agg and max/min_count agg can't be split into multi-stage aggregate.
+		if hasFinalAgg || containsMaxMinCount {
 			return
 		}
 
 		// 2-phase agg
 		// no partition property down，record partition cols inside agg itself, enforce shuffler latter.
-		if !hasTiFlashOnePhaseOnlyAgg {
-			childProp := &property.PhysicalProperty{TaskTp: property.MppTaskType, ExpectedCnt: math.MaxFloat64, MPPPartitionTp: property.AnyType, RejectSort: true, CTEProducerStatus: prop.CTEProducerStatus}
-			agg := NewPhysicalHashAgg(la, la.StatsInfo().ScaleByExpectCnt(prop.ExpectedCnt), childProp)
-			agg.SetSchema(la.Schema().Clone())
-			agg.MppRunMode = Mpp2Phase
-			agg.MppPartitionCols = partitionCols
-			if validMppAgg(agg) {
-				hashAggs = append(hashAggs, agg)
-			}
+		childProp := &property.PhysicalProperty{TaskTp: property.MppTaskType, ExpectedCnt: math.MaxFloat64, MPPPartitionTp: property.AnyType, RejectSort: true, CTEProducerStatus: prop.CTEProducerStatus}
+		agg := NewPhysicalHashAgg(la, la.StatsInfo().ScaleByExpectCnt(prop.ExpectedCnt), childProp)
+		agg.SetSchema(la.Schema().Clone())
+		agg.MppRunMode = Mpp2Phase
+		agg.MppPartitionCols = partitionCols
+		if validMppAgg(agg) {
+			hashAggs = append(hashAggs, agg)
 		}
 
 		// agg runs on TiDB with a partial agg on TiFlash if possible
-		if prop.TaskTp == property.RootTaskType && !hasTiFlashOnePhaseOnlyAgg {
+		if prop.TaskTp == property.RootTaskType {
 			childProp := &property.PhysicalProperty{TaskTp: property.MppTaskType, ExpectedCnt: math.MaxFloat64, RejectSort: true, CTEProducerStatus: prop.CTEProducerStatus}
 			agg := NewPhysicalHashAgg(la, la.StatsInfo().ScaleByExpectCnt(prop.ExpectedCnt), childProp)
 			agg.SetSchema(la.Schema().Clone())
@@ -2796,7 +2794,7 @@ func tryToGetMppHashAggs(la *logicalop.LogicalAggregation, prop *property.Physic
 		childProp := &property.PhysicalProperty{TaskTp: property.MppTaskType, ExpectedCnt: math.MaxFloat64, RejectSort: true, CTEProducerStatus: prop.CTEProducerStatus}
 		agg := NewPhysicalHashAgg(la, la.StatsInfo().ScaleByExpectCnt(prop.ExpectedCnt), childProp)
 		agg.SetSchema(la.Schema().Clone())
-		if la.HasDistinct() || la.HasOrderBy() || hasTiFlashOnePhaseOnlyAgg {
+		if la.HasDistinct() || la.HasOrderBy() || containsMaxMinCount {
 			// mpp scalar mode means the data will be pass through to only one tiFlash node at last.
 			agg.MppRunMode = MppScalar
 		} else {
