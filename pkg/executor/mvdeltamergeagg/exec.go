@@ -2040,6 +2040,7 @@ func (e *Exec) buildRowOps(input *chunk.Chunk, computedByColID []*chunk.Column, 
 	}
 
 	fieldTypes := e.Children(0).RetFieldTypes()
+	typeCtx := e.Ctx().GetSessionVars().StmtCtx.TypeCtx()
 	for bitPos, colID := range e.aggOutputColIDs {
 		if colID < 0 || colID >= input.NumCols() {
 			return nil, nil, 0, 0, errors.Errorf("agg output col %d out of input chunk range", colID)
@@ -2064,6 +2065,7 @@ func (e *Exec) buildRowOps(input *chunk.Chunk, computedByColID []*chunk.Column, 
 			oldCol,
 			newCol,
 			fieldTypes[colID],
+			typeCtx,
 		); err != nil {
 			return nil, nil, 0, 0, err
 		}
@@ -2086,6 +2088,7 @@ func markUpdateTouchedRowsByColumn(
 	oldCol *chunk.Column,
 	newCol *chunk.Column,
 	ft *types.FieldType,
+	typeCtx types.Context,
 ) error {
 	if ft == nil {
 		return errors.New("field type is nil when comparing aggregate outputs")
@@ -2236,33 +2239,9 @@ func markUpdateTouchedRowsByColumn(
 		}
 		return nil
 	case types.ETString:
-		if collate.IsBinCollation(ft.GetCollate()) {
-			for updateOrdinal, rowIdx := range updateRows {
-				oldIsNull := oldCol.IsNull(rowIdx)
-				newIsNull := newCol.IsNull(rowIdx)
-				if oldIsNull || newIsNull {
-					if oldIsNull != newIsNull {
-						updateChanged[updateOrdinal] = true
-						if singleByteStride {
-							updateTouchedBitmap[updateOrdinal] |= bitMask
-						} else {
-							updateTouchedBitmap[updateOrdinal*updateTouchedStride+bitByteOffset] |= bitMask
-						}
-					}
-					continue
-				}
-				if !bytes.Equal(oldCol.GetRaw(rowIdx), newCol.GetRaw(rowIdx)) {
-					updateChanged[updateOrdinal] = true
-					if singleByteStride {
-						updateTouchedBitmap[updateOrdinal] |= bitMask
-					} else {
-						updateTouchedBitmap[updateOrdinal*updateTouchedStride+bitByteOffset] |= bitMask
-					}
-				}
-			}
-			return nil
-		}
-		collator := collate.GetCollator(ft.GetCollate())
+		// Keep update touched detection consistent with updateRecord:
+		// compare with binary collation instead of column collation.
+		binaryCollator := collate.GetBinaryCollator()
 		for updateOrdinal, rowIdx := range updateRows {
 			oldIsNull := oldCol.IsNull(rowIdx)
 			newIsNull := newCol.IsNull(rowIdx)
@@ -2277,7 +2256,13 @@ func markUpdateTouchedRowsByColumn(
 				}
 				continue
 			}
-			if collator.Compare(oldCol.GetString(rowIdx), newCol.GetString(rowIdx)) != 0 {
+			oldDatum := chunkRowColDatum(oldCol, rowIdx, ft)
+			newDatum := chunkRowColDatum(newCol, rowIdx, ft)
+			cmp, err := newDatum.Compare(typeCtx, &oldDatum, binaryCollator)
+			if err != nil {
+				return err
+			}
+			if cmp != 0 {
 				updateChanged[updateOrdinal] = true
 				if singleByteStride {
 					updateTouchedBitmap[updateOrdinal] |= bitMask

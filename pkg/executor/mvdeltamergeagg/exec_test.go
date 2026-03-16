@@ -1786,6 +1786,7 @@ func TestNoOpWhenAggValueUnchanged(t *testing.T) {
 }
 
 func TestMarkUpdateTouchedRowsByColumnStringCollation(t *testing.T) {
+	sctx := mock.NewContext()
 	ft := types.NewFieldType(mysql.TypeVarString)
 	ft.SetCharset("utf8mb4")
 	ft.SetCollate("utf8mb4_general_ci")
@@ -1815,10 +1816,63 @@ func TestMarkUpdateTouchedRowsByColumnStringCollation(t *testing.T) {
 		chk.Column(0),
 		chk.Column(1),
 		ft,
+		sctx.GetSessionVars().StmtCtx.TypeCtx(),
 	)
 	require.NoError(t, err)
-	require.Equal(t, []bool{false, true, false, true}, updateChanged)
-	require.Equal(t, []uint8{0, 1, 0, 1}, updateTouchedBitmap)
+	require.Equal(t, []bool{true, true, false, true}, updateChanged)
+	require.Equal(t, []uint8{1, 1, 0, 1}, updateTouchedBitmap)
+}
+
+func TestMarkUpdateTouchedRowsByColumnEnumSetUseDatumBinaryCompare(t *testing.T) {
+	sctx := mock.NewContext()
+
+	enumFT := types.NewFieldType(mysql.TypeEnum)
+	enumFT.SetCharset("utf8mb4")
+	enumFT.SetCollate("utf8mb4_general_ci")
+	enumChk := chunk.NewChunkWithCapacity([]*types.FieldType{enumFT, enumFT}, 1)
+	enumChk.AppendEnum(0, types.Enum{Name: "x", Value: 1})
+	enumChk.AppendEnum(1, types.Enum{Name: "x", Value: 2})
+
+	enumChanged := make([]bool, 1)
+	enumBitmap := make([]uint8, 1)
+	err := markUpdateTouchedRowsByColumn(
+		[]int{0},
+		enumChanged,
+		enumBitmap,
+		1,
+		0,
+		enumChk.Column(0),
+		enumChk.Column(1),
+		enumFT,
+		sctx.GetSessionVars().StmtCtx.TypeCtx(),
+	)
+	require.NoError(t, err)
+	require.Equal(t, []bool{false}, enumChanged)
+	require.Equal(t, []uint8{0}, enumBitmap)
+
+	setFT := types.NewFieldType(mysql.TypeSet)
+	setFT.SetCharset("utf8mb4")
+	setFT.SetCollate("utf8mb4_general_ci")
+	setChk := chunk.NewChunkWithCapacity([]*types.FieldType{setFT, setFT}, 1)
+	setChk.AppendSet(0, types.Set{Name: "a,b", Value: 3})
+	setChk.AppendSet(1, types.Set{Name: "a,b", Value: 7})
+
+	setChanged := make([]bool, 1)
+	setBitmap := make([]uint8, 1)
+	err = markUpdateTouchedRowsByColumn(
+		[]int{0},
+		setChanged,
+		setBitmap,
+		1,
+		0,
+		setChk.Column(0),
+		setChk.Column(1),
+		setFT,
+		sctx.GetSessionVars().StmtCtx.TypeCtx(),
+	)
+	require.NoError(t, err)
+	require.Equal(t, []bool{false}, setChanged)
+	require.Equal(t, []uint8{0}, setBitmap)
 }
 
 func TestMVDeltaMergeAggRuntimeStatsString(t *testing.T) {
