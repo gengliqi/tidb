@@ -91,6 +91,7 @@ type mockSingleRowRecomputeExec struct {
 	keyCols []*expression.CorrelatedColumn
 	values  map[int64]int64
 	done    bool
+	calls   int
 }
 
 func (m *mockSingleRowRecomputeExec) Open(context.Context) error {
@@ -103,11 +104,39 @@ func (m *mockSingleRowRecomputeExec) Next(_ context.Context, req *chunk.Chunk) e
 	if m.done {
 		return nil
 	}
+	m.calls++
 	key := m.keyCols[0].Data.GetInt64()
 	if v, ok := m.values[key]; ok {
 		req.AppendInt64(0, v)
 	} else {
 		req.AppendNull(0)
+	}
+	m.done = true
+	return nil
+}
+
+type mockSingleRowRecomputeExecMulti struct {
+	exec.BaseExecutor
+	keyCols []*expression.CorrelatedColumn
+	values  map[int64][]int64
+	done    bool
+}
+
+func (m *mockSingleRowRecomputeExecMulti) Open(context.Context) error {
+	m.done = false
+	return nil
+}
+
+func (m *mockSingleRowRecomputeExecMulti) Next(_ context.Context, req *chunk.Chunk) error {
+	req.Reset()
+	if m.done {
+		return nil
+	}
+	key := m.keyCols[0].Data.GetInt64()
+	if vs, ok := m.values[key]; ok {
+		for _, v := range vs {
+			req.AppendInt64(0, v)
+		}
 	}
 	m.done = true
 	return nil
@@ -130,9 +159,11 @@ func (m *mockBatchRecomputeExec) Next(_ context.Context, req *chunk.Chunk) error
 }
 
 type mockBatchRecomputeBuilder struct {
-	sctx   sessionctx.Context
-	retTp  []*types.FieldType
-	values map[int64]int64
+	sctx          sessionctx.Context
+	retTp         []*types.FieldType
+	values        map[int64]int64
+	reverseOutput bool
+	extraRows     [][2]int64
 }
 
 func (b *mockBatchRecomputeBuilder) Build(_ context.Context, req *MinMaxBatchBuildRequest) (exec.Executor, error) {
@@ -140,6 +171,12 @@ func (b *mockBatchRecomputeBuilder) Build(_ context.Context, req *MinMaxBatchBui
 	for _, key := range req.LookupKeys {
 		k := key.Keys[0].GetInt64()
 		rows = append(rows, [2]int64{k, b.values[k]})
+	}
+	rows = append(rows, b.extraRows...)
+	if b.reverseOutput {
+		for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+			rows[i], rows[j] = rows[j], rows[i]
+		}
 	}
 	cols := make([]*expression.Column, len(b.retTp))
 	for i := range b.retTp {
@@ -525,7 +562,88 @@ func TestRejectNullableSumCountDependencyFromDelta(t *testing.T) {
 		DeltaAggColCount: 3,
 	}
 	err = mergeExec.Open(context.Background())
-	require.ErrorContains(t, err, "requires final COUNT(expr) from previously computed columns")
+	require.ErrorContains(t, err, "must come from previously computed columns")
+}
+
+func TestRejectMinMaxDeltaDependencyFromComputed(t *testing.T) {
+	sctx := mock.NewContext()
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{
+		ftInt, // [0] delta_count(*)
+		ftInt, // [1] delta_min_added(v)
+		ftInt, // [2] delta_min_added_cnt(v)
+		ftInt, // [3] delta_min_removed(v)
+		ftInt, // [4] delta_min_removed_cnt(v)
+		ftInt, // [5] group key
+		ftInt, // [6] mv_count(*) output of mapping[0]
+		ftInt, // [7] mv_min(v)
+	}
+	src := newMockSource(sctx, fts, nil)
+
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	minArgTp := types.NewFieldType(mysql.TypeLonglong)
+	minArgTp.AddFlag(mysql.NotNullFlag)
+	minArg := &expression.Column{Index: 1, RetType: minArgTp}
+	minDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMin, []expression.Expression{minArg}, false)
+	require.NoError(t, err)
+
+	for _, depIdx := range []int{0, 1, 2, 3} {
+		deps := []int{1, 2, 3, 4}
+		deps[depIdx] = 6 // force dependency to come from computed output col.
+		mergeExec := &Exec{
+			BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+			AggMappings: []Mapping{
+				{AggFunc: countStarDesc, ColID: []int{6}, DependencyColID: []int{0}},
+				{
+					AggFunc:         minDesc,
+					ColID:           []int{7},
+					DependencyColID: deps,
+					MinMaxRecompute: &MinMaxRecomputeSpec{
+						Strategy:            MinMaxRecomputeBatch,
+						BatchResultColIdxes: []int{1},
+					},
+				},
+			},
+			DeltaAggColCount: 6,
+			MinMaxRecompute: &MinMaxRecomputeExec{
+				KeyInputColIDs: []int{5},
+				BatchBuilder:   &mockBatchRecomputeBuilder{},
+			},
+		}
+		err = mergeExec.Open(context.Background())
+		require.ErrorContains(t, err, "must come from delta aggregation input")
+	}
+}
+
+func TestRejectSumDeltaDependencyFromComputed(t *testing.T) {
+	sctx := mock.NewContext()
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{
+		ftInt, // [0] delta_count(*)
+		ftInt, // [1] delta_sum(x)
+		ftInt, // [2] mv_count(*)
+		ftInt, // [3] mv_sum(x)
+	}
+	src := newMockSource(sctx, fts, nil)
+
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	sumArg := &expression.Column{Index: 1, RetType: ftInt}
+	sumDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncSum, []expression.Expression{sumArg}, false)
+	require.NoError(t, err)
+
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{2}, DependencyColID: []int{0}},
+			// Dependency col 2 points to previously computed COUNT output, invalid for SUM delta dependency.
+			{AggFunc: sumDesc, ColID: []int{3}, DependencyColID: []int{2}},
+		},
+		DeltaAggColCount: 2,
+	}
+	err = mergeExec.Open(context.Background())
+	require.ErrorContains(t, err, "SUM mapping delta dependency col 2: must come from delta aggregation input")
 }
 
 func TestRejectSumTypeMismatch(t *testing.T) {
@@ -573,7 +691,7 @@ func TestRejectCountTypeMismatch(t *testing.T) {
 		DeltaAggColCount: 1,
 	}
 	err = mergeExec.Open(context.Background())
-	require.ErrorContains(t, err, "COUNT mapping dependency eval type must be int")
+	require.ErrorContains(t, err, "COUNT mapping dependency: eval type must be int")
 }
 
 func TestRejectCountUnsignedType(t *testing.T) {
@@ -596,7 +714,37 @@ func TestRejectCountUnsignedType(t *testing.T) {
 		DeltaAggColCount: 1,
 	}
 	err = mergeExec.Open(context.Background())
-	require.ErrorContains(t, err, "COUNT mapping dependency type must be signed integer")
+	require.ErrorContains(t, err, "COUNT mapping dependency: type must be signed integer")
+}
+
+func TestRejectCountDependencyFromComputed(t *testing.T) {
+	sctx := mock.NewContext()
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{
+		ftInt, // [0] delta_count(*)
+		ftInt, // [1] delta_count(x)
+		ftInt, // [2] mv_count(*)
+		ftInt, // [3] mv_count(x)
+	}
+	src := newMockSource(sctx, fts, nil)
+
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	countArg := &expression.Column{Index: 1, RetType: ftInt}
+	countExprDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{countArg}, false)
+	require.NoError(t, err)
+
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{2}, DependencyColID: []int{0}},
+			// Dependency col 2 points to previously computed COUNT(*) output, invalid for COUNT delta dependency.
+			{AggFunc: countExprDesc, ColID: []int{3}, DependencyColID: []int{2}},
+		},
+		DeltaAggColCount: 2,
+	}
+	err = mergeExec.Open(context.Background())
+	require.ErrorContains(t, err, "COUNT mapping dependency col 2: must come from delta aggregation input")
 }
 
 func TestRejectMinMaxForStage1(t *testing.T) {
@@ -668,7 +816,9 @@ func TestMaxFastPathAndSingleRowRecompute(t *testing.T) {
 	src := newMockSource(sctx, fts, []*chunk.Chunk{chk})
 	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
 	require.NoError(t, err)
-	maxArg := &expression.Column{Index: 1, RetType: ftInt}
+	maxArgTp := types.NewFieldType(mysql.TypeLonglong)
+	maxArgTp.AddFlag(mysql.NotNullFlag)
+	maxArg := &expression.Column{Index: 1, RetType: maxArgTp}
 	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
 	require.NoError(t, err)
 
@@ -697,15 +847,7 @@ func TestMaxFastPathAndSingleRowRecompute(t *testing.T) {
 				AggFunc:         maxDesc,
 				ColID:           []int{7},
 				DependencyColID: []int{1, 2, 3, 4},
-			},
-		},
-		DeltaAggColCount: 6,
-		WorkerCnt:        1,
-		MinMaxRecompute: &MinMaxRecomputeExec{
-			KeyInputColIDs: []int{5},
-			Mappings: []*MinMaxRecomputeMapping{
-				nil,
-				{
+				MinMaxRecompute: &MinMaxRecomputeSpec{
 					Strategy: MinMaxRecomputeSingleRow,
 					SingleRow: &MinMaxRecomputeSingleRowExec{
 						Workers: []MinMaxRecomputeSingleRowWorker{
@@ -717,6 +859,11 @@ func TestMaxFastPathAndSingleRowRecompute(t *testing.T) {
 					},
 				},
 			},
+		},
+		DeltaAggColCount: 6,
+		WorkerCnt:        1,
+		MinMaxRecompute: &MinMaxRecomputeExec{
+			KeyInputColIDs: []int{5},
 		},
 	}
 	writer := &collectWriter{}
@@ -739,6 +886,91 @@ func TestMaxFastPathAndSingleRowRecompute(t *testing.T) {
 	require.Equal(t, int64(12), maxCol.GetInt64(0))
 	require.Equal(t, int64(9), maxCol.GetInt64(1))
 	require.Equal(t, int64(5), maxCol.GetInt64(2))
+}
+
+func TestRejectMaxSingleRowRecomputeMultipleRows(t *testing.T) {
+	sctx := mock.NewContext()
+	sctx.GetSessionVars().ExecutorConcurrency = 1
+
+	// Schema:
+	// [0] delta_count(*), [1] delta_max_added(v), [2] delta_max_added_cnt(v),
+	// [3] delta_max_removed(v), [4] delta_max_removed_cnt(v), [5] group_key,
+	// [6] mv_count(*), [7] mv_max(v).
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt}
+	chk := chunk.NewChunkWithCapacity(fts, 1)
+
+	// Force fallback recompute for key=1.
+	chk.AppendInt64(0, 0)
+	chk.AppendNull(1)
+	chk.AppendInt64(2, 0)
+	chk.AppendInt64(3, 10)
+	chk.AppendInt64(4, 1)
+	chk.AppendInt64(5, 1)
+	chk.AppendInt64(6, 3)
+	chk.AppendInt64(7, 10)
+
+	src := newMockSource(sctx, fts, []*chunk.Chunk{chk})
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	maxArgTp := types.NewFieldType(mysql.TypeLonglong)
+	maxArgTp.AddFlag(mysql.NotNullFlag)
+	maxArg := &expression.Column{Index: 1, RetType: maxArgTp}
+	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
+	require.NoError(t, err)
+
+	keyDatum := new(types.Datum)
+	keyCol := &expression.CorrelatedColumn{
+		Column: expression.Column{Index: 0, RetType: ftInt},
+		Data:   keyDatum,
+	}
+	recomputeExec := &mockSingleRowRecomputeExecMulti{
+		BaseExecutor: exec.NewBaseExecutor(
+			sctx,
+			expression.NewSchema(&expression.Column{Index: 0, RetType: ftInt}),
+			0,
+		),
+		keyCols: []*expression.CorrelatedColumn{keyCol},
+		values: map[int64][]int64{
+			1: {9, 8},
+		},
+	}
+
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{6}, DependencyColID: []int{0}},
+			{
+				AggFunc:         maxDesc,
+				ColID:           []int{7},
+				DependencyColID: []int{1, 2, 3, 4},
+				MinMaxRecompute: &MinMaxRecomputeSpec{
+					Strategy: MinMaxRecomputeSingleRow,
+					SingleRow: &MinMaxRecomputeSingleRowExec{
+						Workers: []MinMaxRecomputeSingleRowWorker{
+							{
+								KeyCols: []*expression.CorrelatedColumn{keyCol},
+								Exec:    recomputeExec,
+							},
+						},
+					},
+				},
+			},
+		},
+		DeltaAggColCount: 6,
+		WorkerCnt:        1,
+		MinMaxRecompute: &MinMaxRecomputeExec{
+			KeyInputColIDs: []int{5},
+		},
+	}
+	writer := &collectWriter{}
+	mergeExec.Writer = writer
+
+	require.NoError(t, mergeExec.Open(context.Background()))
+	outChk := exec.NewFirstChunk(mergeExec)
+	err = mergeExec.Next(context.Background(), outChk)
+	require.ErrorContains(t, err, "returns more than one row")
+	require.NoError(t, mergeExec.Close())
 }
 
 func TestMaxBatchRecompute(t *testing.T) {
@@ -776,7 +1008,9 @@ func TestMaxBatchRecompute(t *testing.T) {
 	src := newMockSource(sctx, fts, []*chunk.Chunk{chk})
 	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
 	require.NoError(t, err)
-	maxArg := &expression.Column{Index: 1, RetType: ftInt}
+	maxArgTp := types.NewFieldType(mysql.TypeLonglong)
+	maxArgTp.AddFlag(mysql.NotNullFlag)
+	maxArg := &expression.Column{Index: 1, RetType: maxArgTp}
 	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
 	require.NoError(t, err)
 
@@ -796,20 +1030,17 @@ func TestMaxBatchRecompute(t *testing.T) {
 				AggFunc:         maxDesc,
 				ColID:           []int{7},
 				DependencyColID: []int{1, 2, 3, 4},
+				MinMaxRecompute: &MinMaxRecomputeSpec{
+					Strategy:            MinMaxRecomputeBatch,
+					BatchResultColIdxes: []int{1},
+				},
 			},
 		},
 		DeltaAggColCount: 6,
 		WorkerCnt:        1,
 		MinMaxRecompute: &MinMaxRecomputeExec{
 			KeyInputColIDs: []int{5},
-			Mappings: []*MinMaxRecomputeMapping{
-				nil,
-				{
-					Strategy:            MinMaxRecomputeBatch,
-					BatchResultColIdxes: []int{1},
-				},
-			},
-			BatchBuilder: batchBuilder,
+			BatchBuilder:   batchBuilder,
 		},
 	}
 	writer := &collectWriter{}
@@ -832,6 +1063,495 @@ func TestMaxBatchRecompute(t *testing.T) {
 	require.Equal(t, int64(12), maxCol.GetInt64(1))
 }
 
+func TestMaxBatchRecomputeWithOutOfOrderResultRows(t *testing.T) {
+	sctx := mock.NewContext()
+	sctx.GetSessionVars().ExecutorConcurrency = 1
+
+	// Schema:
+	// [0] delta_count(*), [1] delta_max_added(v), [2] delta_max_added_cnt(v),
+	// [3] delta_max_removed(v), [4] delta_max_removed_cnt(v), [5] group_key,
+	// [6] mv_count(*), [7] mv_max(v).
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt}
+	chk := chunk.NewChunkWithCapacity(fts, 2)
+
+	// row0: fallback, batch recompute returns 8.
+	chk.AppendInt64(0, 0)
+	chk.AppendNull(1)
+	chk.AppendInt64(2, 0)
+	chk.AppendInt64(3, 10)
+	chk.AppendInt64(4, 1)
+	chk.AppendInt64(5, 1)
+	chk.AppendInt64(6, 3)
+	chk.AppendInt64(7, 10)
+
+	// row1: fallback, batch recompute returns 15.
+	chk.AppendInt64(0, 0)
+	chk.AppendNull(1)
+	chk.AppendInt64(2, 0)
+	chk.AppendInt64(3, 20)
+	chk.AppendInt64(4, 1)
+	chk.AppendInt64(5, 2)
+	chk.AppendInt64(6, 4)
+	chk.AppendInt64(7, 20)
+
+	src := newMockSource(sctx, fts, []*chunk.Chunk{chk})
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	maxArgTp := types.NewFieldType(mysql.TypeLonglong)
+	maxArgTp.AddFlag(mysql.NotNullFlag)
+	maxArg := &expression.Column{Index: 1, RetType: maxArgTp}
+	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
+	require.NoError(t, err)
+
+	// Return rows in reverse key order to verify batch result order does not affect overrides.
+	batchBuilder := &mockBatchRecomputeBuilder{
+		sctx:          sctx,
+		retTp:         []*types.FieldType{ftInt, ftInt},
+		reverseOutput: true,
+		values: map[int64]int64{
+			1: 8,
+			2: 15,
+		},
+	}
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{6}, DependencyColID: []int{0}},
+			{
+				AggFunc:         maxDesc,
+				ColID:           []int{7},
+				DependencyColID: []int{1, 2, 3, 4},
+				MinMaxRecompute: &MinMaxRecomputeSpec{
+					Strategy:            MinMaxRecomputeBatch,
+					BatchResultColIdxes: []int{1},
+				},
+			},
+		},
+		DeltaAggColCount: 6,
+		WorkerCnt:        1,
+		MinMaxRecompute: &MinMaxRecomputeExec{
+			KeyInputColIDs: []int{5},
+			BatchBuilder:   batchBuilder,
+		},
+	}
+	writer := &collectWriter{}
+	mergeExec.Writer = writer
+
+	require.NoError(t, mergeExec.Open(context.Background()))
+	outChk := exec.NewFirstChunk(mergeExec)
+	require.NoError(t, mergeExec.Next(context.Background(), outChk))
+	require.NoError(t, mergeExec.Close())
+
+	require.Len(t, writer.results, 1)
+	res := writer.results[0]
+	require.Len(t, res.RowOps, 2)
+	require.Equal(t, RowOpUpdate, res.RowOps[0].Tp)
+	require.Equal(t, RowOpUpdate, res.RowOps[1].Tp)
+
+	maxCol := res.ComputedCols[7]
+	require.NotNil(t, maxCol)
+	require.Equal(t, int64(8), maxCol.GetInt64(0))
+	require.Equal(t, int64(15), maxCol.GetInt64(1))
+}
+
+func TestRejectMaxBatchRecomputeUnexpectedKey(t *testing.T) {
+	sctx := mock.NewContext()
+	sctx.GetSessionVars().ExecutorConcurrency = 1
+
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt}
+	chk := chunk.NewChunkWithCapacity(fts, 1)
+
+	chk.AppendInt64(0, 0)
+	chk.AppendNull(1)
+	chk.AppendInt64(2, 0)
+	chk.AppendInt64(3, 10)
+	chk.AppendInt64(4, 1)
+	chk.AppendInt64(5, 1)
+	chk.AppendInt64(6, 3)
+	chk.AppendInt64(7, 10)
+
+	src := newMockSource(sctx, fts, []*chunk.Chunk{chk})
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	maxArgTp := types.NewFieldType(mysql.TypeLonglong)
+	maxArgTp.AddFlag(mysql.NotNullFlag)
+	maxArg := &expression.Column{Index: 1, RetType: maxArgTp}
+	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
+	require.NoError(t, err)
+
+	batchBuilder := &mockBatchRecomputeBuilder{
+		sctx:  sctx,
+		retTp: []*types.FieldType{ftInt, ftInt},
+		values: map[int64]int64{
+			1: 8,
+		},
+		extraRows: [][2]int64{{999, 1}},
+	}
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{6}, DependencyColID: []int{0}},
+			{
+				AggFunc:         maxDesc,
+				ColID:           []int{7},
+				DependencyColID: []int{1, 2, 3, 4},
+				MinMaxRecompute: &MinMaxRecomputeSpec{
+					Strategy:            MinMaxRecomputeBatch,
+					BatchResultColIdxes: []int{1},
+				},
+			},
+		},
+		DeltaAggColCount: 6,
+		WorkerCnt:        1,
+		MinMaxRecompute: &MinMaxRecomputeExec{
+			KeyInputColIDs: []int{5},
+			BatchBuilder:   batchBuilder,
+		},
+	}
+	writer := &collectWriter{}
+	mergeExec.Writer = writer
+
+	require.NoError(t, mergeExec.Open(context.Background()))
+	outChk := exec.NewFirstChunk(mergeExec)
+	err = mergeExec.Next(context.Background(), outChk)
+	require.ErrorContains(t, err, "returns an unexpected key")
+	require.NoError(t, mergeExec.Close())
+}
+
+func TestRejectMaxBatchRecomputeKeyTypeMismatch(t *testing.T) {
+	sctx := mock.NewContext()
+	sctx.GetSessionVars().ExecutorConcurrency = 1
+
+	// Schema:
+	// [0] delta_count(*), [1] delta_max_added(v), [2] delta_max_added_cnt(v),
+	// [3] delta_max_removed(v), [4] delta_max_removed_cnt(v), [5] group_key,
+	// [6] mv_count(*), [7] mv_max(v).
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	ftReal := types.NewFieldType(mysql.TypeDouble)
+	fts := []*types.FieldType{ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt}
+	chk := chunk.NewChunkWithCapacity(fts, 1)
+
+	// fallback path, must trigger batch recompute.
+	chk.AppendInt64(0, 0)
+	chk.AppendNull(1)
+	chk.AppendInt64(2, 0)
+	chk.AppendInt64(3, 10)
+	chk.AppendInt64(4, 1)
+	chk.AppendInt64(5, 1)
+	chk.AppendInt64(6, 3)
+	chk.AppendInt64(7, 10)
+
+	src := newMockSource(sctx, fts, []*chunk.Chunk{chk})
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	maxArgTp := types.NewFieldType(mysql.TypeLonglong)
+	maxArgTp.AddFlag(mysql.NotNullFlag)
+	maxArg := &expression.Column{Index: 1, RetType: maxArgTp}
+	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
+	require.NoError(t, err)
+
+	// key type mismatch: batch result key type is DOUBLE, input key type is BIGINT.
+	batchBuilder := &mockBatchRecomputeBuilder{
+		sctx:  sctx,
+		retTp: []*types.FieldType{ftReal, ftInt},
+		values: map[int64]int64{
+			1: 8,
+		},
+	}
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{6}, DependencyColID: []int{0}},
+			{
+				AggFunc:         maxDesc,
+				ColID:           []int{7},
+				DependencyColID: []int{1, 2, 3, 4},
+				MinMaxRecompute: &MinMaxRecomputeSpec{
+					Strategy:            MinMaxRecomputeBatch,
+					BatchResultColIdxes: []int{1},
+				},
+			},
+		},
+		DeltaAggColCount: 6,
+		WorkerCnt:        1,
+		MinMaxRecompute: &MinMaxRecomputeExec{
+			KeyInputColIDs: []int{5},
+			BatchBuilder:   batchBuilder,
+		},
+	}
+	writer := &collectWriter{}
+	mergeExec.Writer = writer
+
+	require.NoError(t, mergeExec.Open(context.Background()))
+	outChk := exec.NewFirstChunk(mergeExec)
+	err = mergeExec.Next(context.Background(), outChk)
+	require.ErrorContains(t, err, "min/max batch key type mismatch")
+	require.NoError(t, mergeExec.Close())
+}
+
+func TestRejectMaxBatchRecomputeResultTypeMismatch(t *testing.T) {
+	sctx := mock.NewContext()
+	sctx.GetSessionVars().ExecutorConcurrency = 1
+
+	// Schema:
+	// [0] delta_count(*), [1] delta_max_added(v), [2] delta_max_added_cnt(v),
+	// [3] delta_max_removed(v), [4] delta_max_removed_cnt(v), [5] group_key,
+	// [6] mv_count(*), [7] mv_max(v).
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	ftReal := types.NewFieldType(mysql.TypeDouble)
+	fts := []*types.FieldType{ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt}
+	chk := chunk.NewChunkWithCapacity(fts, 1)
+
+	// fallback path, must trigger batch recompute.
+	chk.AppendInt64(0, 0)
+	chk.AppendNull(1)
+	chk.AppendInt64(2, 0)
+	chk.AppendInt64(3, 10)
+	chk.AppendInt64(4, 1)
+	chk.AppendInt64(5, 1)
+	chk.AppendInt64(6, 3)
+	chk.AppendInt64(7, 10)
+
+	src := newMockSource(sctx, fts, []*chunk.Chunk{chk})
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	maxArgTp := types.NewFieldType(mysql.TypeLonglong)
+	maxArgTp.AddFlag(mysql.NotNullFlag)
+	maxArg := &expression.Column{Index: 1, RetType: maxArgTp}
+	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
+	require.NoError(t, err)
+
+	// result type mismatch: output max(v) is BIGINT, but batch result col is DOUBLE.
+	batchBuilder := &mockBatchRecomputeBuilder{
+		sctx:  sctx,
+		retTp: []*types.FieldType{ftInt, ftReal},
+		values: map[int64]int64{
+			1: 8,
+		},
+	}
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{6}, DependencyColID: []int{0}},
+			{
+				AggFunc:         maxDesc,
+				ColID:           []int{7},
+				DependencyColID: []int{1, 2, 3, 4},
+				MinMaxRecompute: &MinMaxRecomputeSpec{
+					Strategy:            MinMaxRecomputeBatch,
+					BatchResultColIdxes: []int{1},
+				},
+			},
+		},
+		DeltaAggColCount: 6,
+		WorkerCnt:        1,
+		MinMaxRecompute: &MinMaxRecomputeExec{
+			KeyInputColIDs: []int{5},
+			BatchBuilder:   batchBuilder,
+		},
+	}
+	writer := &collectWriter{}
+	mergeExec.Writer = writer
+
+	require.NoError(t, mergeExec.Open(context.Background()))
+	outChk := exec.NewFirstChunk(mergeExec)
+	err = mergeExec.Next(context.Background(), outChk)
+	require.ErrorContains(t, err, "min/max batch result type mismatch")
+	require.NoError(t, mergeExec.Close())
+}
+
+func TestMinMaxFallbackToCountStarWithoutFinalCountDependency(t *testing.T) {
+	sctx := mock.NewContext()
+	sctx.GetSessionVars().ExecutorConcurrency = 1
+
+	// Schema:
+	// [0] delta_count(*), [1] delta_max_added(v), [2] delta_max_added_cnt(v),
+	// [3] delta_max_removed(v), [4] delta_max_removed_cnt(v), [5] group_key,
+	// [6] mv_count(*), [7] mv_max(v).
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt, ftInt}
+	chk := chunk.NewChunkWithCapacity(fts, 1)
+
+	// Delete all rows in this group. MAX should short-circuit to NULL using fallback COUNT(*),
+	// and must not trigger recompute.
+	chk.AppendInt64(0, -3)
+	chk.AppendNull(1)
+	chk.AppendInt64(2, 0)
+	chk.AppendInt64(3, 10)
+	chk.AppendInt64(4, 1)
+	chk.AppendInt64(5, 1)
+	chk.AppendInt64(6, 3)
+	chk.AppendInt64(7, 10)
+
+	src := newMockSource(sctx, fts, []*chunk.Chunk{chk})
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	maxArgTp := types.NewFieldType(mysql.TypeLonglong)
+	maxArgTp.AddFlag(mysql.NotNullFlag)
+	maxArg := &expression.Column{Index: 1, RetType: maxArgTp}
+	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
+	require.NoError(t, err)
+
+	keyDatum := new(types.Datum)
+	keyCol := &expression.CorrelatedColumn{
+		Column: expression.Column{Index: 0, RetType: ftInt},
+		Data:   keyDatum,
+	}
+	recomputeExec := &mockSingleRowRecomputeExec{
+		BaseExecutor: exec.NewBaseExecutor(
+			sctx,
+			expression.NewSchema(&expression.Column{Index: 0, RetType: ftInt}),
+			0,
+		),
+		keyCols: []*expression.CorrelatedColumn{keyCol},
+		values: map[int64]int64{
+			1: 9,
+		},
+	}
+
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{6}, DependencyColID: []int{0}},
+			{
+				AggFunc:         maxDesc,
+				ColID:           []int{7},
+				DependencyColID: []int{1, 2, 3, 4},
+				MinMaxRecompute: &MinMaxRecomputeSpec{
+					Strategy: MinMaxRecomputeSingleRow,
+					SingleRow: &MinMaxRecomputeSingleRowExec{
+						Workers: []MinMaxRecomputeSingleRowWorker{
+							{
+								KeyCols: []*expression.CorrelatedColumn{keyCol},
+								Exec:    recomputeExec,
+							},
+						},
+					},
+				},
+			},
+		},
+		DeltaAggColCount: 6,
+		WorkerCnt:        1,
+		MinMaxRecompute: &MinMaxRecomputeExec{
+			KeyInputColIDs: []int{5},
+		},
+	}
+	writer := &collectWriter{}
+	mergeExec.Writer = writer
+
+	require.NoError(t, mergeExec.Open(context.Background()))
+	outChk := exec.NewFirstChunk(mergeExec)
+	require.NoError(t, mergeExec.Next(context.Background(), outChk))
+	require.NoError(t, mergeExec.Close())
+
+	require.Equal(t, 0, recomputeExec.calls)
+	require.Len(t, writer.results, 1)
+	res := writer.results[0]
+	require.Len(t, res.RowOps, 1)
+	require.Equal(t, RowOpDelete, res.RowOps[0].Tp)
+
+	maxCol := res.ComputedCols[7]
+	require.NotNil(t, maxCol)
+	require.True(t, maxCol.IsNull(0))
+}
+
+func TestRejectMinMaxFallbackToCountStarForNullableExpr(t *testing.T) {
+	sctx := mock.NewContext()
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{
+		ftInt, // [0] delta_count(*)
+		ftInt, // [1] delta_max_added(v)
+		ftInt, // [2] delta_max_added_cnt(v)
+		ftInt, // [3] delta_max_removed(v)
+		ftInt, // [4] delta_max_removed_cnt(v)
+		ftInt, // [5] group key
+		ftInt, // [6] mv_count(*)
+		ftInt, // [7] mv_max(v)
+	}
+	src := newMockSource(sctx, fts, nil)
+
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	// RetType without NotNullFlag means nullable expression.
+	maxArg := &expression.Column{Index: 1, RetType: ftInt}
+	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
+	require.NoError(t, err)
+
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{6}, DependencyColID: []int{0}},
+			{
+				AggFunc:         maxDesc,
+				ColID:           []int{7},
+				DependencyColID: []int{1, 2, 3, 4},
+				MinMaxRecompute: &MinMaxRecomputeSpec{
+					Strategy:            MinMaxRecomputeBatch,
+					BatchResultColIdxes: []int{1},
+				},
+			},
+		},
+		DeltaAggColCount: 6,
+		WorkerCnt:        1,
+		MinMaxRecompute: &MinMaxRecomputeExec{
+			KeyInputColIDs: []int{5},
+			BatchBuilder:   &mockBatchRecomputeBuilder{},
+		},
+	}
+	err = mergeExec.Open(context.Background())
+	require.ErrorContains(t, err, "max(nullable expr) requires final-count dependency")
+}
+
+func TestRejectMinMaxFinalCountForNonNullableExpr(t *testing.T) {
+	sctx := mock.NewContext()
+	ftInt := types.NewFieldType(mysql.TypeLonglong)
+	fts := []*types.FieldType{
+		ftInt, // [0] delta_count(*)
+		ftInt, // [1] delta_max_added(v)
+		ftInt, // [2] delta_max_added_cnt(v)
+		ftInt, // [3] delta_max_removed(v)
+		ftInt, // [4] delta_max_removed_cnt(v)
+		ftInt, // [5] group key
+		ftInt, // [6] mv_count(*)
+		ftInt, // [7] mv_max(v)
+	}
+	src := newMockSource(sctx, fts, nil)
+
+	countStarDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncCount, []expression.Expression{expression.NewOne()}, false)
+	require.NoError(t, err)
+	maxArgTp := types.NewFieldType(mysql.TypeLonglong)
+	maxArgTp.AddFlag(mysql.NotNullFlag)
+	maxArg := &expression.Column{Index: 1, RetType: maxArgTp}
+	maxDesc, err := aggregation.NewAggFuncDesc(sctx.GetExprCtx(), ast.AggFuncMax, []expression.Expression{maxArg}, false)
+	require.NoError(t, err)
+
+	mergeExec := &Exec{
+		BaseExecutor: exec.NewBaseExecutor(sctx, nil, 0, src),
+		AggMappings: []Mapping{
+			{AggFunc: countStarDesc, ColID: []int{6}, DependencyColID: []int{0}},
+			{
+				AggFunc:         maxDesc,
+				ColID:           []int{7},
+				DependencyColID: []int{1, 2, 3, 4, 6},
+				MinMaxRecompute: &MinMaxRecomputeSpec{
+					Strategy:            MinMaxRecomputeBatch,
+					BatchResultColIdxes: []int{1},
+				},
+			},
+		},
+		DeltaAggColCount: 6,
+		WorkerCnt:        1,
+		MinMaxRecompute: &MinMaxRecomputeExec{
+			KeyInputColIDs: []int{5},
+			BatchBuilder:   &mockBatchRecomputeBuilder{},
+		},
+	}
+	err = mergeExec.Open(context.Background())
+	require.ErrorContains(t, err, "max(non-nullable expr) must not set final-count dependency")
+}
+
 func TestRejectMinMaxRecomputeValidation(t *testing.T) {
 	sctx := mock.NewContext()
 	ftInt := types.NewFieldType(mysql.TypeLonglong)
@@ -850,35 +1570,65 @@ func TestRejectMinMaxRecomputeValidation(t *testing.T) {
 		expectedError string
 	}{
 		{
-			name:       "mapping length mismatch",
+			name:       "non-minmax mapping with recompute metadata",
 			fieldTypes: []*types.FieldType{ftInt, ftInt},
 			aggMappings: []Mapping{
-				{AggFunc: countStarDesc, ColID: []int{1}, DependencyColID: []int{0}},
+				{
+					AggFunc:         countStarDesc,
+					ColID:           []int{1},
+					DependencyColID: []int{0},
+					MinMaxRecompute: &MinMaxRecomputeSpec{
+						Strategy:            MinMaxRecomputeBatch,
+						BatchResultColIdxes: []int{1},
+					},
+				},
 			},
 			minMax: &MinMaxRecomputeExec{
 				KeyInputColIDs: []int{0},
-				Mappings:       nil, // expect length 1
+				BatchBuilder:   &mockBatchRecomputeBuilder{},
 			},
-			expectedError: "MinMaxRecompute.Mappings length mismatch",
+			expectedError: "set for non-MIN/MAX",
 		},
 		{
 			name:       "batch strategy without builder",
 			fieldTypes: []*types.FieldType{ftInt, ftInt, ftInt},
 			aggMappings: []Mapping{
 				{AggFunc: countStarDesc, ColID: []int{1}, DependencyColID: []int{0}},
-				{AggFunc: minDesc, ColID: []int{2}, DependencyColID: []int{0}},
+				{
+					AggFunc:         minDesc,
+					ColID:           []int{2},
+					DependencyColID: []int{0},
+					MinMaxRecompute: &MinMaxRecomputeSpec{
+						Strategy:            MinMaxRecomputeBatch,
+						BatchResultColIdxes: []int{1},
+					},
+				},
 			},
 			minMax: &MinMaxRecomputeExec{
 				KeyInputColIDs: []int{0},
-				Mappings: []*MinMaxRecomputeMapping{
-					nil,
-					{
+			},
+			expectedError: "batch strategy requires BatchBuilder",
+		},
+		{
+			name:       "batch result index overlaps key prefix",
+			fieldTypes: []*types.FieldType{ftInt, ftInt, ftInt},
+			aggMappings: []Mapping{
+				{AggFunc: countStarDesc, ColID: []int{1}, DependencyColID: []int{0}},
+				{
+					AggFunc:         minDesc,
+					ColID:           []int{2},
+					DependencyColID: []int{0},
+					MinMaxRecompute: &MinMaxRecomputeSpec{
 						Strategy:            MinMaxRecomputeBatch,
 						BatchResultColIdxes: []int{0},
 					},
 				},
 			},
-			expectedError: "batch strategy requires BatchBuilder",
+			minMax: &MinMaxRecomputeExec{
+				KeyInputColIDs: []int{0},
+				BatchBuilder:   &mockBatchRecomputeBuilder{},
+			},
+			expectedError: "conflicts with key prefix",
 		},
 	}
 
@@ -1035,34 +1785,18 @@ func TestNoOpWhenAggValueUnchanged(t *testing.T) {
 	require.Equal(t, uint8(0), writer.results[0].UpdateTouchedBitmap[0])
 }
 
-func TestMarkChangedRowsByColumnFloat32(t *testing.T) {
-	ft := types.NewFieldType(mysql.TypeFloat)
-	chk := chunk.NewChunkWithCapacity([]*types.FieldType{ft, ft}, 4)
-
-	chk.AppendFloat32(0, 1.5)
-	chk.AppendFloat32(1, 1.5)
-
-	chk.AppendFloat32(0, 2.5)
-	chk.AppendFloat32(1, 2.0)
-
-	chk.AppendNull(0)
-	chk.AppendNull(1)
-
-	chk.AppendNull(0)
-	chk.AppendFloat32(1, 3.0)
-
-	assertChangedMask(t, chk, ft, []bool{false, true, false, true})
-}
-
-func TestMarkChangedRowsByColumnString(t *testing.T) {
+func TestMarkUpdateTouchedRowsByColumnStringCollation(t *testing.T) {
+	sctx := mock.NewContext()
 	ft := types.NewFieldType(mysql.TypeVarString)
+	ft.SetCharset("utf8mb4")
+	ft.SetCollate("utf8mb4_general_ci")
 	chk := chunk.NewChunkWithCapacity([]*types.FieldType{ft, ft}, 4)
 
-	chk.AppendString(0, "abc")
-	chk.AppendString(1, "abc")
+	chk.AppendString(0, "A")
+	chk.AppendString(1, "a")
 
-	chk.AppendString(0, "abc")
-	chk.AppendString(1, "abd")
+	chk.AppendString(0, "Ab")
+	chk.AppendString(1, "ac")
 
 	chk.AppendNull(0)
 	chk.AppendNull(1)
@@ -1070,103 +1804,75 @@ func TestMarkChangedRowsByColumnString(t *testing.T) {
 	chk.AppendNull(0)
 	chk.AppendString(1, "x")
 
-	assertChangedMask(t, chk, ft, []bool{false, true, false, true})
-}
-
-func TestMarkChangedRowsByColumnTime(t *testing.T) {
-	ft := types.NewFieldType(mysql.TypeDatetime)
-	chk := chunk.NewChunkWithCapacity([]*types.FieldType{ft, ft}, 4)
-
-	t1 := types.NewTime(types.FromDate(2026, 2, 1, 10, 0, 0, 0), mysql.TypeDatetime, 0)
-	t2 := types.NewTime(types.FromDate(2026, 2, 1, 10, 0, 1, 0), mysql.TypeDatetime, 0)
-
-	chk.AppendTime(0, t1)
-	chk.AppendTime(1, t1)
-
-	chk.AppendTime(0, t1)
-	chk.AppendTime(1, t2)
-
-	chk.AppendNull(0)
-	chk.AppendNull(1)
-
-	chk.AppendNull(0)
-	chk.AppendTime(1, t1)
-
-	assertChangedMask(t, chk, ft, []bool{false, true, false, true})
-}
-
-func TestMarkChangedRowsByColumnDuration(t *testing.T) {
-	ft := types.NewFieldType(mysql.TypeDuration)
-	chk := chunk.NewChunkWithCapacity([]*types.FieldType{ft, ft}, 4)
-
-	d1 := types.NewDuration(0, 0, 1, 0, 0)
-	d2 := types.NewDuration(0, 0, 2, 0, 0)
-
-	chk.AppendDuration(0, d1)
-	chk.AppendDuration(1, d1)
-
-	chk.AppendDuration(0, d1)
-	chk.AppendDuration(1, d2)
-
-	chk.AppendNull(0)
-	chk.AppendNull(1)
-
-	chk.AppendNull(0)
-	chk.AppendDuration(1, d1)
-
-	assertChangedMask(t, chk, ft, []bool{false, true, false, true})
-}
-
-func TestMarkChangedRowsByColumnJSON(t *testing.T) {
-	ft := types.NewFieldType(mysql.TypeJSON)
-	chk := chunk.NewChunkWithCapacity([]*types.FieldType{ft, ft}, 4)
-
-	j1 := types.CreateBinaryJSON(int64(1))
-	j2 := types.CreateBinaryJSON(int64(2))
-
-	chk.AppendJSON(0, j1)
-	chk.AppendJSON(1, j1)
-
-	chk.AppendJSON(0, j1)
-	chk.AppendJSON(1, j2)
-
-	chk.AppendNull(0)
-	chk.AppendNull(1)
-
-	chk.AppendNull(0)
-	chk.AppendJSON(1, j1)
-
-	assertChangedMask(t, chk, ft, []bool{false, true, false, true})
-}
-
-func TestMarkChangedRowsByColumnVector(t *testing.T) {
-	ft := types.NewFieldType(mysql.TypeTiDBVectorFloat32)
-	chk := chunk.NewChunkWithCapacity([]*types.FieldType{ft, ft}, 4)
-
-	v1 := types.MustCreateVectorFloat32([]float32{1, 2})
-	v2 := types.MustCreateVectorFloat32([]float32{1, 3})
-
-	chk.AppendVectorFloat32(0, v1)
-	chk.AppendVectorFloat32(1, v1)
-
-	chk.AppendVectorFloat32(0, v1)
-	chk.AppendVectorFloat32(1, v2)
-
-	chk.AppendNull(0)
-	chk.AppendNull(1)
-
-	chk.AppendNull(0)
-	chk.AppendVectorFloat32(1, v1)
-
-	assertChangedMask(t, chk, ft, []bool{false, true, false, true})
-}
-
-func assertChangedMask(t *testing.T, chk *chunk.Chunk, ft *types.FieldType, expected []bool) {
-	t.Helper()
-	mask := make([]bool, chk.NumRows())
-	err := markChangedRowsByColumn(mask, chk.Column(0), chk.Column(1), ft)
+	updateRows := []int{0, 1, 2, 3}
+	updateChanged := make([]bool, len(updateRows))
+	updateTouchedBitmap := make([]uint8, len(updateRows))
+	err := markUpdateTouchedRowsByColumn(
+		updateRows,
+		updateChanged,
+		updateTouchedBitmap,
+		1,
+		0,
+		chk.Column(0),
+		chk.Column(1),
+		ft,
+		sctx.GetSessionVars().StmtCtx.TypeCtx(),
+	)
 	require.NoError(t, err)
-	require.Equal(t, expected, mask)
+	require.Equal(t, []bool{true, true, false, true}, updateChanged)
+	require.Equal(t, []uint8{1, 1, 0, 1}, updateTouchedBitmap)
+}
+
+func TestMarkUpdateTouchedRowsByColumnEnumSetUseDatumBinaryCompare(t *testing.T) {
+	sctx := mock.NewContext()
+
+	enumFT := types.NewFieldType(mysql.TypeEnum)
+	enumFT.SetCharset("utf8mb4")
+	enumFT.SetCollate("utf8mb4_general_ci")
+	enumChk := chunk.NewChunkWithCapacity([]*types.FieldType{enumFT, enumFT}, 1)
+	enumChk.AppendEnum(0, types.Enum{Name: "x", Value: 1})
+	enumChk.AppendEnum(1, types.Enum{Name: "x", Value: 2})
+
+	enumChanged := make([]bool, 1)
+	enumBitmap := make([]uint8, 1)
+	err := markUpdateTouchedRowsByColumn(
+		[]int{0},
+		enumChanged,
+		enumBitmap,
+		1,
+		0,
+		enumChk.Column(0),
+		enumChk.Column(1),
+		enumFT,
+		sctx.GetSessionVars().StmtCtx.TypeCtx(),
+	)
+	require.NoError(t, err)
+	require.Equal(t, []bool{false}, enumChanged)
+	require.Equal(t, []uint8{0}, enumBitmap)
+
+	setFT := types.NewFieldType(mysql.TypeSet)
+	setFT.SetCharset("utf8mb4")
+	setFT.SetCollate("utf8mb4_general_ci")
+	setChk := chunk.NewChunkWithCapacity([]*types.FieldType{setFT, setFT}, 1)
+	setChk.AppendSet(0, types.Set{Name: "a,b", Value: 3})
+	setChk.AppendSet(1, types.Set{Name: "a,b", Value: 7})
+
+	setChanged := make([]bool, 1)
+	setBitmap := make([]uint8, 1)
+	err = markUpdateTouchedRowsByColumn(
+		[]int{0},
+		setChanged,
+		setBitmap,
+		1,
+		0,
+		setChk.Column(0),
+		setChk.Column(1),
+		setFT,
+		sctx.GetSessionVars().StmtCtx.TypeCtx(),
+	)
+	require.NoError(t, err)
+	require.Equal(t, []bool{false}, setChanged)
+	require.Equal(t, []uint8{0}, setBitmap)
 }
 
 func TestMVDeltaMergeAggRuntimeStatsString(t *testing.T) {
