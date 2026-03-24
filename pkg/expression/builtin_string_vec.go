@@ -30,6 +30,7 @@ import (
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/chunk"
 	"github.com/pingcap/tidb/pkg/util/collate"
+	"github.com/pingcap/tidb/pkg/util/hack"
 )
 
 //revive:disable:defer
@@ -1127,6 +1128,22 @@ func (b *builtinFindInSetSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, re
 	if err := b.args[0].VecEvalString(ctx, input, str); err != nil {
 		return err
 	}
+	result.ResizeInt64(n, false)
+	result.MergeNulls(str)
+	res := result.Int64s()
+
+	if b.hasConstStrlistLookup {
+		for i := 0; i < n; i++ {
+			if result.IsNull(i) {
+				continue
+			}
+			if pos, exists := b.constStrlistLookup[string(hack.String(b.ctor.KeyWithoutTrimRightSpace(str.GetString(i))))]; exists {
+				res[i] = pos
+			}
+		}
+		return nil
+	}
+
 	strlist, err := b.bufAllocator.get()
 	if err != nil {
 		return err
@@ -1135,9 +1152,7 @@ func (b *builtinFindInSetSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, re
 	if err := b.args[1].VecEvalString(ctx, input, strlist); err != nil {
 		return err
 	}
-	result.ResizeInt64(n, false)
-	result.MergeNulls(str, strlist)
-	res := result.Int64s()
+	result.MergeNulls(strlist)
 	for i := range n {
 		if result.IsNull(i) {
 			continue
@@ -1147,11 +1162,7 @@ func (b *builtinFindInSetSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, re
 			res[i] = 0
 			continue
 		}
-		for j, strInSet := range strings.Split(strlistI, ",") {
-			if b.ctor.Compare(str.GetString(i), strInSet) == 0 {
-				res[i] = int64(j + 1)
-			}
-		}
+		res[i] = findInSetByKey(b.ctor.KeyWithoutTrimRightSpace(str.GetString(i)), strlistI, b.ctor)
 	}
 	return nil
 }
