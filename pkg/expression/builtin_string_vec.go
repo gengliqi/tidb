@@ -1133,7 +1133,7 @@ func (b *builtinFindInSetSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, re
 	res := result.Int64s()
 
 	if b.hasConstStrlistLookup {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if result.IsNull(i) {
 				continue
 			}
