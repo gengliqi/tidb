@@ -1162,11 +1162,6 @@ func getSignatureByPB(ctx BuildContext, sigCode tipb.ScalarFuncSig, tp *tipb.Fie
 		e = ErrFunctionNotExists.GenWithStackByArgs("FUNCTION", sigCode)
 		return nil, e
 	}
-	if findInSetSig, ok := f.(*builtinFindInSetSig); ok {
-		if err := findInSetSig.buildConstStrlistLookup(ctx); err != nil {
-			return nil, err
-		}
-	}
 	f.setPbCode(sigCode)
 	return f, nil
 }

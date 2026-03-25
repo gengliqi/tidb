@@ -1132,12 +1132,20 @@ func (b *builtinFindInSetSig) vecEvalInt(ctx EvalContext, input *chunk.Chunk, re
 	result.MergeNulls(str)
 	res := result.Int64s()
 
-	if b.hasConstStrlistLookup {
+	if b.args[1].ConstLevel() >= ConstOnlyInContext {
+		cached, err := b.getConstStrlistLookup(ctx)
+		if err != nil {
+			return err
+		}
+		if cached.isNull {
+			result.ResizeInt64(n, true)
+			return nil
+		}
 		for i := range n {
 			if result.IsNull(i) {
 				continue
 			}
-			if pos, exists := b.constStrlistLookup[string(hack.String(b.ctor.KeyWithoutTrimRightSpace(str.GetString(i))))]; exists {
+			if pos, exists := cached.lookup[string(hack.String(b.ctor.KeyWithoutTrimRightSpace(str.GetString(i))))]; exists {
 				res[i] = pos
 			}
 		}

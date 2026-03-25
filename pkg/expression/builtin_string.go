@@ -2631,10 +2631,13 @@ func (c *findInSetFunctionClass) getFunction(ctx BuildContext, args []Expression
 	bf.tp.SetFlen(3)
 	sig := &builtinFindInSetSig{baseBuiltinFunc: bf}
 	sig.setPbCode(tipb.ScalarFuncSig_FindInSet)
-	if err := sig.buildConstStrlistLookup(ctx); err != nil {
-		return nil, err
-	}
 	return sig, nil
+}
+
+type findInSetCachedLookup struct {
+	lookup   map[string]int64
+	isNull   bool
+	memUsage int64
 }
 
 type builtinFindInSetSig struct {
@@ -2642,17 +2645,12 @@ type builtinFindInSetSig struct {
 	// NOTE: Any new fields added here must be thread-safe or immutable during execution,
 	// as this expression may be shared across sessions.
 	// If a field does not meet these requirements, set SafeToShareAcrossSession to false.
-	constStrlistLookup         map[string]int64
-	hasConstStrlistLookup      bool
-	constStrlistLookupMemUsage int64
+	constStrlistLookupCache builtinFuncCache[findInSetCachedLookup]
 }
 
 func (b *builtinFindInSetSig) Clone() builtinFunc {
 	newSig := &builtinFindInSetSig{}
 	newSig.cloneFrom(&b.baseBuiltinFunc)
-	newSig.constStrlistLookup = b.constStrlistLookup
-	newSig.hasConstStrlistLookup = b.hasConstStrlistLookup
-	newSig.constStrlistLookupMemUsage = b.constStrlistLookupMemUsage
 	return newSig
 }
 
@@ -2695,20 +2693,20 @@ func findInSetByKey(strKey []byte, strlist string, collator collate.Collator) in
 	return 0
 }
 
-func (b *builtinFindInSetSig) buildConstStrlistLookup(ctx BuildContext) error {
-	if b.args[1].ConstLevel() != ConstStrict {
-		return nil
-	}
-	strlist, isNull, err := b.args[1].EvalString(ctx.GetEvalCtx(), chunk.Row{})
-	if err != nil {
-		return err
-	}
-	if isNull {
-		return nil
-	}
-	b.constStrlistLookup, b.constStrlistLookupMemUsage = buildFindInSetLookup(strlist, b.ctor)
-	b.hasConstStrlistLookup = true
-	return nil
+func (b *builtinFindInSetSig) getConstStrlistLookup(ctx EvalContext) (findInSetCachedLookup, error) {
+	return b.constStrlistLookupCache.getOrInitCache(ctx, func() (findInSetCachedLookup, error) {
+		var cached findInSetCachedLookup
+		strlist, isNull, err := b.args[1].EvalString(ctx, chunk.Row{})
+		if err != nil {
+			return cached, err
+		}
+		if isNull {
+			cached.isNull = true
+			return cached, nil
+		}
+		cached.lookup, cached.memUsage = buildFindInSetLookup(strlist, b.ctor)
+		return cached, nil
+	})
 }
 
 // MemoryUsage returns memory usage of builtinFindInSetSig.
@@ -2716,11 +2714,10 @@ func (b *builtinFindInSetSig) MemoryUsage() (sum int64) {
 	if b == nil {
 		return
 	}
-	sum = b.baseBuiltinFunc.MemoryUsage() +
-		size.SizeOfMap +
-		size.SizeOfBool +
-		size.SizeOfInt64 +
-		b.constStrlistLookupMemUsage
+	sum = b.baseBuiltinFunc.MemoryUsage()
+	if cached := b.constStrlistLookupCache.cached.Load(); cached != nil {
+		sum += cached.item.memUsage
+	}
 	return
 }
 
@@ -2734,11 +2731,18 @@ func (b *builtinFindInSetSig) evalInt(ctx EvalContext, row chunk.Row) (int64, bo
 		return 0, isNull, err
 	}
 
-	if b.hasConstStrlistLookup {
-		if len(b.constStrlistLookup) == 0 {
+	if b.args[1].ConstLevel() >= ConstOnlyInContext {
+		cached, err := b.getConstStrlistLookup(ctx)
+		if err != nil {
+			return 0, false, err
+		}
+		if cached.isNull {
+			return 0, true, nil
+		}
+		if len(cached.lookup) == 0 {
 			return 0, false, nil
 		}
-		if pos, exists := b.constStrlistLookup[string(hack.String(b.ctor.KeyWithoutTrimRightSpace(str)))]; exists {
+		if pos, exists := cached.lookup[string(hack.String(b.ctor.KeyWithoutTrimRightSpace(str)))]; exists {
 			return pos, false, nil
 		}
 		return 0, false, nil
