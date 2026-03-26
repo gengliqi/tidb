@@ -1218,6 +1218,10 @@ func TestFindInSetConstOnlyInContextStrlistLookup(t *testing.T) {
 	ctx := createContext(t)
 	fc := funcs[ast.FindInSet]
 	const padSpaceCollation = "utf8mb4_general_ci"
+	resetStmtCtx := func() {
+		ctx.GetSessionVars().StmtCtx = ctx.GetSessionVars().InitStatementContext()
+		ctx.ResetSessionAndStmtTimeZone(ctx.GetSessionVars().TimeZone)
+	}
 
 	str := types.NewCollationStringDatum(" ", padSpaceCollation)
 	strTp := types.NewFieldType(mysql.TypeVarString)
@@ -1275,7 +1279,7 @@ func TestFindInSetConstOnlyInContextStrlistLookup(t *testing.T) {
 	// New statement context should rebuild the cache.
 	ctx.GetSessionVars().PlanCacheParams.Reset()
 	ctx.GetSessionVars().PlanCacheParams.Append(types.NewCollationStringDatum(" ,a", padSpaceCollation))
-	ctx.GetSessionVars().StmtCtx = ctx.GetSessionVars().InitStatementContext()
+	resetStmtCtx()
 	d, err = evalBuiltinFunc(fn, ctx, chunk.Row{})
 	require.NoError(t, err)
 	require.Equal(t, int64(1), d.GetInt64())
@@ -1286,7 +1290,7 @@ func TestFindInSetConstOnlyInContextStrlistLookup(t *testing.T) {
 	// Null strlist in const-only-in-context should return NULL and cache null state.
 	ctx.GetSessionVars().PlanCacheParams.Reset()
 	ctx.GetSessionVars().PlanCacheParams.Append(types.NewDatum(nil))
-	ctx.GetSessionVars().StmtCtx = ctx.GetSessionVars().InitStatementContext()
+	resetStmtCtx()
 	d, err = evalBuiltinFunc(fn, ctx, chunk.Row{})
 	require.NoError(t, err)
 	require.True(t, d.IsNull())
